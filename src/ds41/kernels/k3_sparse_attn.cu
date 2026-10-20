@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cassert>
+#include <stdexcept>
 #include "strata/ds41/config.hpp"
 
 namespace strata::ds41::kernels {
@@ -114,7 +115,7 @@ __global__ __launch_bounds__(kThreads, 6) void attention_online(
         const bf16* __restrict__ q, const bf16* __restrict__ window,
         const bf16* __restrict__ comp, const int32_t* __restrict__ idx,
         int n_idx, const float* __restrict__ sink, float scale,
-        bf16* __restrict__ output, const int* t_dev = nullptr) {
+        bf16* __restrict__ output, const int* t_dev = nullptr, int first_head = 0) {
     if (t_dev) {
         const int t = *t_dev;
         assert(t >= 0);
@@ -126,7 +127,7 @@ __global__ __launch_bounds__(kThreads, 6) void attention_online(
     const int query = blockIdx.z;
     const int output_group = blockIdx.y;
     const int output_dimension = output_group * kOutputDim;
-    const int head = blockIdx.x * kHeadTile;
+    const int head = first_head + blockIdx.x * kHeadTile;
     const int head0 = (lane & 3) * 2;
     const int head1 = head0 + 1;
     const int mma_row = lane >> 2;
@@ -287,19 +288,22 @@ __global__ __launch_bounds__(kThreads, 6) void attention_online(
 
 void sparse_attn_decode(const bf16* q, const bf16* window, const bf16* comp,
                         const int32_t* idx, int m, int n_idx, const float* sink, float scale,
-                        bf16* o, cudaStream_t stream) {
+                         bf16* o, cudaStream_t stream, int first_head, int heads) {
     if (m <= 0) return;
-    if (m > 8 || n_idx < 0 || n_idx > 1024) {
+    if (m > 8 || n_idx < 0 || n_idx > 1024 || first_head<0 || heads<=0 ||
+        first_head%kHeadTile || heads%kHeadTile || first_head+heads>kHeads) {
         std::fprintf(stderr, "sparse_attn_decode: invalid shape m=%d n_idx=%d\n", m, n_idx);
         std::abort();
     }
-    attention_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, m), kThreads, 0, stream>>>(
-        q, window, comp, idx, n_idx, sink, scale, o);
+    attention_online<<<dim3(heads / kHeadTile, kDim / kOutputDim, m), kThreads, 0, stream>>>(
+        q, window, comp, idx, n_idx, sink, scale, o, nullptr, first_head);
 }
 void sparse_attn_decode_device(const bf16* q, const bf16* window, const bf16* comp,
                                const int32_t* idx, const int* t_dev, const float* sink,
-                               float scale, bf16* o, cudaStream_t stream) {
-    attention_online<<<dim3(kHeads / kHeadTile, kDim / kOutputDim, 1), kThreads, 0, stream>>>(
-        q, window, comp, idx, kWindow + strata::ds41::kIndexTopK, sink, scale, o, t_dev);
+                                float scale, bf16* o, cudaStream_t stream, int first_head, int heads) {
+    if(first_head<0 || heads<=0 || first_head%kHeadTile || heads%kHeadTile || first_head+heads>kHeads)
+        throw std::invalid_argument("sparse attention: invalid owned head range");
+    attention_online<<<dim3(heads / kHeadTile, kDim / kOutputDim, 1), kThreads, 0, stream>>>(
+        q, window, comp, idx, kWindow + strata::ds41::kIndexTopK, sink, scale, o, t_dev, first_head);
 }
 }  // namespace strata::ds41::kernels

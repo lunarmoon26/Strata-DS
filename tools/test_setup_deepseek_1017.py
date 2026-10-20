@@ -78,11 +78,20 @@ class Installer(unittest.TestCase):
         self.assertEqual(cfg["parallel"], 2)
         self.assertEqual(cfg["args"][-4:], ["--batch", "2", "--spec", "dspark"])
 
+    def test_tensor_parallel_is_explicit_and_not_a_layer_split(self):
+        cfg = self.install("--parallelism", "tensor", "--context", "4096", "--draft-cache-mib", "0")
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--parallelism") + 1], "tensor")
+        self.assertNotIn("--split-layer", args)
+        self.assertEqual(args[args.index("--spec") + 1], "none")
+        self.assertEqual(args[args.index("--draft-cache-mib") + 1], "0")
+
     def test_bad_settings_and_unsupported_flags_leave_no_files(self):
         cases = (("--context", "524289"), ("--context", "0"), ("--port", "0"),
                  ("--parallel", "5"), ("--parallel", "0"), ("--gpus", "0,0"),
                  ("--gpus", "all"), ("--telemetry-gpus", "1,1"), ("--telemetry-gpus", "0"),
                  ("--host", "0.0.0.0"), ("--backend", "hip"), ("--rope-scaling", "yarn"),
+                 ("--draft-cache-mib", "-1"), ("--draft-cache-mib", "8193"),
                  ("--build",), ("--source", "huggingface"), ("--vision", "yes"), ("--browser",))
         for extra in cases:
             with self.subTest(extra=extra):
@@ -93,7 +102,9 @@ class Installer(unittest.TestCase):
     def test_profile_flags_never_enter_qwen_or_sage(self):
         for flags in (["--configure-only"], ["--family", "qwen", "--configure-only"],
                       ["--family", "deepseek", "--model", "SAGE-1.59BPW", "--configure-only"],
-                      ["--family", "qwen", "--spec", "none"]):
+                      ["--family", "qwen", "--spec", "none"],
+                      ["--family", "qwen", "--parallelism", "tensor"],
+                      ["--family", "qwen", "--draft-cache-mib", "0"]):
             self.assertNotEqual(self.invoke(flags), 0)
 
     def test_missing_pack_prevents_any_outputs(self):

@@ -7071,9 +7071,11 @@ def main() -> int:
     ap.add_argument("--configure-only", action="store_true",
                     help="1017 only: validate existing assets and write private launch files; no downloads, build or start")
     ap.add_argument("--ds41-engine", help="1017: existing ds41_serve executable")
+    ap.add_argument("--parallelism", choices=("layer", "tensor"), help="1017: layer split (default) or experimental TP2")
     ap.add_argument("--telemetry-gpus", help="1017: two physical monitoring indices, independent of CUDA order")
     ap.add_argument("--log-dir", help="1017: engine logs and shared service.lock directory")
     ap.add_argument("--spec", choices=["none", "suffix", "dspark"], help="1017: greedy draft mode (default none)")
+    ap.add_argument("--draft-cache-mib", type=int, help="1017: bounded MTP-only GPU cache, 0 disables (default 1024)")
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -7203,7 +7205,7 @@ def main() -> int:
             return ds1017.start(ROOT / ds1017.CONFIG_NAME)
         except (ValueError, OSError, KeyError, IndexError) as e:
             ap.error(str(e))
-    if any(x is not None for x in (a.ds41_engine, a.telemetry_gpus, a.log_dir, a.spec)):
+    if any(x is not None for x in (a.ds41_engine, a.telemetry_gpus, a.log_dir, a.spec, a.parallelism, a.draft_cache_mib)):
         ap.error("1017-specific flags require its explicit --family deepseek --model " + ds1017.MODEL)
     if (ROOT / ds1017.CONFIG_NAME).is_file() and not any((
             a.family, a.model, a.setup, a.check, a.no_start, a.inspect, a.rollback_engine)):

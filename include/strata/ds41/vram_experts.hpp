@@ -65,7 +65,7 @@ public:
     /// first pairs while their bytes fit in the free VRAM after keeping `reserve_bytes` free (and the workspace), as
     /// upstream (it stops at the first that does not fit). 0 slots is valid (no tier).
     VramExperts(const Pack& pack, const std::string& profile_path, int64_t n_slots, size_t reserve_bytes,
-                Adapt adapt, int first_layer = 0, int end_layer = -1, bool require_all = false);
+                Adapt adapt, int first_layer = 0, int end_layer = -1, bool require_all = false, int tensor_rank = -1);
     ~VramExperts();
     VramExperts(const VramExperts&) = delete;
     VramExperts& operator=(const VramExperts&) = delete;

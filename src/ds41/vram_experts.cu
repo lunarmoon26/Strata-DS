@@ -1,6 +1,7 @@
 // src/ds41/vram_experts.cu - see include/strata/ds41/vram_experts.hpp.
 #include "strata/ds41/vram_experts.hpp"
 #include "strata/ds41/bounded_upload.hpp"
+#include "strata/ds41/tensor_shards.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/residency.hpp"
@@ -103,7 +104,7 @@ std::vector<ExpertSwap> plan_expert_swaps(const std::vector<float>& usage, const
 }
 
 VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int64_t n_slots, size_t reserve_bytes,
-                         Adapt adapt, int first_layer, int end_layer, bool require_all)
+                         Adapt adapt, int first_layer, int end_layer, bool require_all, int tensor_rank)
     : pack_(pack), adapt_(adapt) {
     try {
         const int L = pack.n_layers(), E = pack.n_experts();
@@ -112,13 +113,17 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
             throw std::invalid_argument("ds41 vram: invalid stage layer range");
         if (require_all && (adapt.every != 0 || n_slots != -1))
             throw std::invalid_argument("ds41 vram: resident stage requires all slots and static residency");
+        if (tensor_rank != -1 && (tensor_rank < 0 || tensor_rank > 1 || !require_all || !pack.has_exl3_dense() || pack.has_mcg()))
+            throw std::invalid_argument("TP2 expert residency requires rank 0/1, all slots and full mul1 EXL3");
         ck(cudaGetDevice(&device_), "cudaGetDevice");
         res_host_.assign((size_t) L * E, -1);
         usage_.assign((size_t) L * E, 0.0f);
         ck(cudaMalloc(&res_dev_, res_host_.size() * sizeof(int32_t)), "residency table");
         ck(cudaMalloc(&ws_, kWorkspaceBytes), "K10 workspace");
         ck(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "copy stream");
-        auto slot_size = [&](int l, int e) { return (size_t) (pack.expert(l, e).bytes + 255) / 256 * 256; };
+        auto slot_size = [&](int l, int e) {
+            return tensor_rank >= 0 ? tensor_expert_bytes(pack.expert(l,e)) : (size_t)(pack.expert(l,e).bytes+255)/256*256;
+        };
         if (require_all || (n_slots != 0 && !profile_path.empty())) {
             std::vector<std::pair<int, int>> ranked;
             if (require_all) {
@@ -162,6 +167,11 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
                     for (int p = 0; p < 3; ++p) if (x.codebook[p] == 1) {
                         if (!upload || upload->scalar_u32(x.offset + x.comp_off[p * 4 + 3]) != 0xCBAC1FEDu)
                             throw std::runtime_error("ds41 vram: unknown MCG marker or non-resident MCG loading");
+                    }
+                    if (tensor_rank>=0) {
+                        desc_host_[s]=upload_tensor_expert(*upload,x,arena_+off_[s],tensor_rank);
+                        publish_residency(res_host_[size_t(l)*E+e],s);
+                        continue;
                     }
                     if (upload) upload->copy(arena_ + off_[s], x.offset, x.bytes);
                     else ck(cudaMemcpy(arena_ + off_[s], base + x.offset, x.bytes, cudaMemcpyHostToDevice), "expert copy");

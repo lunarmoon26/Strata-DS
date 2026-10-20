@@ -71,6 +71,9 @@ public:
     uint64_t upload_dense();
     /// Split decode: upload only the stage's tensors through 4 MiB pinned staging.
     uint64_t upload_dense(const StageRange& stage, bool draft = false);
+    /// TP2 output-channel slices and embeddings, complete owned attention-output
+    /// groups, and replicated small projections. Original source shapes/bytes stay unchanged.
+    uint64_t upload_dense_tensor(int device, int rank, bool draft = false);
     /// Maps experts.bin read-only (MAP_SHARED: pages come from the OS page cache, as upstream's mmap tier).
     void map_experts();
 
@@ -105,6 +108,8 @@ private:
     int n_experts_ = 0;
     std::map<std::string, DenseTensor> dense_;
     std::vector<ExpertSlot> experts_;
+    int tensor_rank_ = -1;
+    mutable std::map<std::string,int> tensor_collectives_;
     std::vector<EngramTable> engram_;
     EngramHash hash_;
     void* arena_ = nullptr;

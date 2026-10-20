@@ -32,7 +32,7 @@ LEGACY_GENERATOR = "deepseek-v4.1-flash/install.sh"
 SUPPORTED_FLAGS = {
     "--family", "--model", "--configure-only", "--data-dir", "--ds41-engine",
     "--gpus", "--telemetry-gpus", "--log-dir", "--context", "--port", "--parallel",
-    "--spec", "--host", "--no-start", "--no-browser", "--yes", "--setup", "--backend",
+    "--spec", "--host", "--no-start", "--no-browser", "--yes", "--setup", "--backend", "--parallelism", "--draft-cache-mib",
 }
 
 
@@ -56,6 +56,9 @@ def configuration(a, root=ROOT):
     if not 1 <= port <= 65535:
         raise ValueError("port must be in 1..65535")
     spec = a.spec or "none"
+    parallelism = a.parallelism or "layer"
+    if a.draft_cache_mib is not None and not 0 <= a.draft_cache_mib <= 8192:
+        raise ValueError("1017 draft cache must be in 0..8192 MiB")
     if spec not in ("none", "suffix", "dspark"):
         raise ValueError("1017 spec must be none|suffix|dspark")
     gpus = (a.gpus or "0,1").split(",")
@@ -79,7 +82,9 @@ def configuration(a, root=ROOT):
     return {
         "_generated_by": GENERATOR, "format": "deepseek_v41", "model_name": MODEL_ID,
         "aliases": ["strata"], "tokenizer": str(model), "exe": str(exe), "cwd": str(root),
-        "args": ["--pack", str(pack), "--devices", "0,1", "--split-layer", "18",
+        "args": ["--pack", str(pack), "--devices", "0,1",
+                 *(["--parallelism", "tensor"] if parallelism == "tensor" else ["--split-layer", "18"]),
+                 *(["--draft-cache-mib", str(a.draft_cache_mib)] if a.draft_cache_mib is not None else []),
                  "--max-context", str(context), "--threads", "2", "--ram-budget-gib", "0",
                  "--adapt-every", "0", "--vram-slots", "-1", "--vram-reserve-mib", "1024",
                  "--prefill-chunk", "1024", "--prefill-batch", "256", "--snapshots", "4",
@@ -120,7 +125,8 @@ def check(cfg):
     from serve.deepseek import DeepSeekTokenizer
     if DeepSeekTokenizer(model).eos_id != 1:
         raise ValueError("wrong tokenizer EOS")
-    print(f"Checked: {MODEL_ID}, pinned pack metadata, two-GPU layer-18 split", flush=True)
+    mode = "TP2 peer collectives" if "--parallelism" in cfg["args"] else "layer-18 split"
+    print(f"Checked: {MODEL_ID}, pinned pack metadata, two-GPU {mode}", flush=True)
 
 
 def preflight(cfg):

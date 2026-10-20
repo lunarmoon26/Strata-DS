@@ -34,6 +34,8 @@
 #include "strata/ds41/vram_experts.hpp"
 #include "strata/ds41/wo_a_fp8.hpp"
 #include "strata/ds41/exl3_linear.hpp"
+#include "strata/ds41/tensor_parallel.hpp"
+#include "strata/ds41/tensor_shards.hpp"
 
 #include "moe_mul1.h"   // third_party/exllamav3_moe
 
@@ -80,6 +82,16 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+template<class F> void tensor_both(const std::shared_ptr<TensorParallel>& world,F&& function) {
+    auto invoke=[&](int rank) {
+        try { function(rank); }
+        catch(...) { world->abort(); throw; }
+    };
+    auto first=std::async(std::launch::async,invoke,0);
+    auto second=std::async(std::launch::async,invoke,1);
+    first.get();second.get();
+}
+
 /// precompute_freqs_cis in fp32, as model.py computes it: [seqlen][32] (cos, sin) pairs
 std::vector<float> rope_table(int seqlen, bool yarn) {
     const int dim = kRopeDim;
@@ -124,6 +136,13 @@ __global__ void engram_rows_k(const uint4* src, uint4* dst, int n16) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += gridDim.x * blockDim.x) dst[i] = __ldcv(src + i);
 }
 
+__global__ void tensor_embed_k(const bf16* table,const int* tokens,int rows,int token_stride,bf16* out,int rank) {
+    const int d=blockIdx.x*blockDim.x+threadIdx.x,row=blockIdx.y;
+    if(d>=kDim/2 || row>=rows) return;
+    const bf16 value=table[size_t(tokens[row*token_stride])*(kDim/2)+d];
+    for(int c=0;c<kHc;++c) out[(size_t(row)*kHc+c)*kDim+rank*(kDim/2)+d]=value;
+}
+
 }  // namespace
 
 struct Engine::Impl {
@@ -134,6 +153,11 @@ struct Engine::Impl {
     StageRange stage;
     std::unique_ptr<StageTransfer> handoff;
     bool partitioned() const { return stage.begin != 0 || stage.end != kLayers; }
+    bool resident_backend() const { return partitioned() || opt.tensor_parallel; }
+    std::shared_ptr<TensorParallel> tensor;
+    int tensor_rank = -1;
+    Impl* tensor_cache_source = nullptr;  // read-only peer alias; one writer owns append-only KV/index rows
+    bool owns_cache() const { return !tensor_cache_source; }
 
     struct Fp8 {
         const uint8_t* w = nullptr; const uint8_t* s = nullptr;
@@ -466,7 +490,13 @@ struct Engine::Impl {
     }
     PrefillProgress progress;          // prefill progress (set_prefill_progress); a false return cancels
     // snapshot slots: the window rings of all layers, then the compressor states of the kv sources with ratio > 1
-    struct Snapshot { int pos = -1; bf16* win = nullptr; float* comp = nullptr; };
+    struct Snapshot {
+        int pos = -1;
+        bf16* win = nullptr;
+        float* comp = nullptr;
+        std::vector<uint8_t> draft;
+        int draft_n = 0, draft_pos0 = 0;
+    };
     // batch slots (EngineOptions.batch_slots, src/ds41/batch.cu): per slot, every layer's attention state and its tokens
     struct SlotLayer {
         bf16 *window = nullptr, *comp = nullptr, *idx_keys = nullptr;
@@ -536,11 +566,11 @@ struct Engine::Impl {
 
     void init() {
         DeviceScope scope(stage.device);
-        if (partitioned() && (!pack.has_exl3_dense() || pack.has_mcg()))
+        if (resident_backend() && (!pack.has_exl3_dense() || pack.has_mcg()))
             throw std::invalid_argument("ds41: resident serving targets the published sudoingx 1017 full mul1 EXL3 profile only");
-        if (pack.has_mcg() && !partitioned())
+        if (pack.has_mcg() && !resident_backend())
             throw std::invalid_argument("ds41: MCG K2 currently requires the resident --devices split; CPU fallback is unsupported");
-        if (pack.has_exl3_dense() && !partitioned())
+        if (pack.has_exl3_dense() && !resident_backend())
             throw std::invalid_argument("ds41: full EXL3 requires resident --devices split, no CPU fallback");
         if (partitioned() && opt.prefill_chunk > 0 && (!pack.has_exl3_dense() || pack.has_mcg()))
             throw std::invalid_argument("ds41: split batched prefill currently requires the full mul1 EXL3 profile");
@@ -548,12 +578,13 @@ struct Engine::Impl {
         // says otherwise: with the adaptive tier the prefetch computes guessed RAM experts on the GPU, following the
         // tier's history, and step() and step_slots() would no longer give the same tokens (engine.hpp's promise)
         if (opt.adapt_every == 0 && !std::getenv("DS41_RAM_ADAPT")) ram_adapt = 0;
-        if (partitioned()) pack.upload_dense(stage, opt.dspark && stage.end == kLayers);
+        if (tensor) pack.upload_dense_tensor(stage.device,tensor_rank,opt.dspark);
+        else if (partitioned()) pack.upload_dense(stage, opt.dspark && stage.end == kLayers);
         else {
             pack.upload_dense();
             pack.map_experts();
         }
-        if (opt.dspark && !partitioned()) {   // split drafts stream one published expert through bounded staging
+        if (opt.dspark && !resident_backend()) {   // resident drafts use bounded GPU staging
             const double t0 = now_ms();
             const uint64_t b = pack.load_mtp_experts();
             std::fprintf(stderr, "ds41: DSpark experts in RAM (%.2f GiB) in %.1f s\n", b / (double) (1ull << 30),
@@ -579,7 +610,8 @@ struct Engine::Impl {
             y.kv_norm = bf(p + "attn.kv_norm.weight");
             if (pack.has_dense(p + "attn.wo_a.slice.0.trellis")) {
                 for (int group = 0; group < kOGroups; ++group)
-                    y.wo_a_exl3[group] = pack.exl3_projection(p + "attn.wo_a.slice." + std::to_string(group),
+                    if(!tensor || group/(kOGroups/2)==tensor_rank)
+                        y.wo_a_exl3[group] = pack.exl3_projection(p + "attn.wo_a.slice." + std::to_string(group),
                                                            kHeads * kHeadDim / kOGroups, kOLora);
             } else if (pack.has_dense(p + "attn.wo_a.scale")) y.wo_a8 = fp8(p + "attn.wo_a");
             else y.wo_a = bf(p + "attn.wo_a.weight");
@@ -601,8 +633,13 @@ struct Engine::Impl {
                 y.c_wkv = bf(p + "attn.compressor.wkv.weight");
                 y.c_norm = bf(p + "attn.compressor.norm.weight");
                 if (y.ratio > 1) y.c_wgate = bf(p + "attn.compressor.wgate.weight");
-                y.comp = dalloc_own<bf16>((size_t) (max_seq / y.ratio + 1) * kHeadDim);
-                y.idx_keys = dalloc_own<bf16>((size_t) (max_seq / y.ratio + 1) * kIndexDim);
+                if(tensor_cache_source) {
+                    y.comp=tensor_cache_source->L[l].comp;
+                    y.idx_keys=tensor_cache_source->L[l].idx_keys;
+                } else {
+                    y.comp = dalloc_own<bf16>((size_t) (max_seq / y.ratio + 1) * kHeadDim);
+                    y.idx_keys = dalloc_own<bf16>((size_t) (max_seq / y.ratio + 1) * kIndexDim);
+                }
                 if (y.ratio > 1) {
                     y.kv_state = dalloc_own<float>((size_t) y.ratio * kHeadDim);
                     y.score_state = dalloc_own<float>((size_t) y.ratio * kHeadDim);
@@ -627,7 +664,7 @@ struct Engine::Impl {
                     {y.sh_w2.k, y.sh_w2.n, kMoeInter, kDim}})
                 if (dims[0] != dims[2] || dims[1] != dims[3])
                     throw std::runtime_error("ds41: linear dimensions do not match model geometry");
-            if (!partitioned()) register_cpu_experts(l);
+            if (!resident_backend()) register_cpu_experts(l);
         }
         if (pack.has_exl3_dense()) {
             dense_ws = dalloc_own<uint8_t>(dense_workspace_bytes);
@@ -726,7 +763,7 @@ struct Engine::Impl {
         cand_dev = dalloc_own<uint8_t>(max_seq + 1);
         history.reserve(max_seq);
         alloc_snapshots();   // before the VRAM tier sizes itself from the free memory
-        if (!partitioned()) db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
+        if (!resident_backend()) db = std::make_unique<ExpertDoorbell>(1, kTopK, kDim);
         gpu_sel = dalloc_own<int32_t>(kTopK);
         // decode stream, graph staging, outputs
         ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "decode stream");
@@ -811,13 +848,13 @@ struct Engine::Impl {
         alloc_slots();   // the batch slots' state and staging, before the VRAM tier sizes itself
         if (opt.dspark && (!partitioned() || stage.end == kLayers)) dspark_init();
         // the VRAM expert tier last: an automatic slot count takes what the rest left free
-        if (partitioned() || (!opt.expert_profile.empty() && opt.vram_expert_slots != 0)) {
+        if (resident_backend() || (!opt.expert_profile.empty() && opt.vram_expert_slots != 0)) {
             VramExperts::Adapt ad;
             ad.every = opt.adapt_every;
             ad.decay = opt.adapt_decay;
             ad.max_swaps = opt.adapt_swaps;
             vram = std::make_unique<VramExperts>(pack, opt.expert_profile, opt.vram_expert_slots,
-                                                 opt.vram_reserve_bytes, ad, stage.begin, stage.end, partitioned());
+                                                 opt.vram_reserve_bytes, ad, stage.begin, stage.end, resident_backend(),tensor_rank);
             std::fprintf(stderr, "ds41: %d VRAM expert slots (%.2f GiB)\n", vram->slots(),
                          vram->arena_bytes() / (double) (1ull << 30));
         }
@@ -825,7 +862,7 @@ struct Engine::Impl {
             const char* e = std::getenv("DS41_ROUTE_TAIL_SKIP");
             const double cached = vram ? (double) vram->slots() / (double) (kLayers * kExperts) : 0.0;
             const char* es = std::getenv("DS41_SSD_TAIL_SKIP");
-            const SkipRanks sr = partitioned() ? SkipRanks{} : skip_ranks(e, es, vram != nullptr, cached);
+            const SkipRanks sr = resident_backend() ? SkipRanks{} : skip_ranks(e, es, vram != nullptr, cached);
             tail_rank = sr.tail;
             ssd_rank = sr.ssd;
             if (tail_rank)
@@ -904,7 +941,7 @@ struct Engine::Impl {
         const char* la_ahead_env = std::getenv("DS41_LOOKAHEAD_AHEAD");
         const int la_ahead = la_ahead_env ? std::atoi(la_ahead_env) : 1;
         if (la_ahead < 1 || la_ahead > 3) throw std::invalid_argument("DS41_LOOKAHEAD_AHEAD must be in [1, 3]");
-        if (!partitioned() && (la_env ? la_env[0] != '0' : !adaptive || few)) {
+        if (!resident_backend() && (la_env ? la_env[0] != '0' : !adaptive || few)) {
             std::vector<std::vector<uint16_t>> rw(kLayers, std::vector<uint16_t>((size_t) kExperts * kDim));
             std::vector<std::vector<float>> rb(kLayers, std::vector<float>(kExperts));
             for (int l = 0; l < kLayers; ++l) {
@@ -921,7 +958,7 @@ struct Engine::Impl {
                                                           },
                                                           std::move(fetch), la_ahead);
         }
-        if (!partitioned()) worker = std::thread([this] { worker_loop(); });
+        if (!resident_backend()) worker = std::thread([this] { worker_loop(); });
         if (const char* p = std::getenv("DS41_DEBUG")) dbg = std::fopen(p, "wb");
     }
 
@@ -952,12 +989,31 @@ struct Engine::Impl {
     }
 
     /// model.py linear() for one token: K1's activation quantizer, then K1's GEMV (act holds up to 8192 floats)
+    void projection(const bf16* x,const kernels::Exl3Proj& w,bf16* y,float* logits,int rows,
+                    int xs,int ys,void* ws,size_t bytes,cudaStream_t stream,
+                    bool communicate=true,bool acknowledge=true) {
+        const int offset=w.shard_count==2 ? w.shard_rank*w.n : 0;
+        if(rows==1)
+            exl3_linear(x,w,y?y+offset:nullptr,logits?logits+offset:nullptr,ws,bytes,stream);
+        else exl3_linear_small_rows(x,w,y?y+offset:nullptr,logits?logits+offset:nullptr,
+                                    rows,xs,ys,ws,bytes,stream);
+        if(w.shard_count==2 && communicate) {
+            if(!tensor) throw std::logic_error("TP2 projection has no collective context");
+            tensor->gather(tensor_rank,w.collective_slot,y?static_cast<void*>(y):static_cast<void*>(logits),
+                           rows,w.n*2,y?2:4,stream,ys,acknowledge);
+        }
+    }
+    void embedding(const int* params,int rows,int param_stride,bf16* output,cudaStream_t stream) {
+        if(tensor) {
+            tensor_embed_k<<<dim3((kDim/2+255)/256,rows),256,0,stream>>>(embed,params,rows,param_stride,output,tensor_rank);
+            tensor->gather(tensor_rank,0,output,rows*kHc,kDim,2,stream,0,false);
+        } else for(int r=0;r<rows;++r) ops::embed_device(embed,params+r*param_stride,output+size_t(r)*kHc*kDim,stream);
+    }
     void fp8_linear(const bf16* x, const Fp8& w, bf16* y) { fp8_linear_on(x, w, y, act, st); }
     void fp8_linear_on(const bf16* x, const Fp8& w, bf16* y, float* scratch, cudaStream_t s) {
         if (w.exl3.trellis) {
             void* ws = s == st_sh ? dense_sh_ws : s == st_kv ? dense_kv_ws : s == st_eng ? dense_eng_ws : dense_ws;
-            exl3_linear(x, w.exl3, y, nullptr, ws,
-                        dense_workspace_bytes, s);
+            projection(x,w.exl3,y,nullptr,1,w.k,w.n,ws,dense_workspace_bytes,s);
             return;
         }
         fp8_quantize_activation_f32((const uint16_t*) x, 1, w.k, scratch, s);
@@ -1279,9 +1335,10 @@ struct Engine::Impl {
             ops::rmsnorm(ik, y.idx_knorm, ik, kIndexDim, kNormEps, 1, st);
             ops::rope_device(ik, 1, kIndexDim, rope_yarn, dp + 1, 1 - ratio, false, st);
             ops::fp4_quant_inplace(ik, kIndexDim, 32, false, st);
-            ops::row_copy_device(y.idx_keys, ik, kIndexDim * 2, dp + 1, ratio, max_seq + 1, st);   // row pos / ratio
+            if(owns_cache()) ops::row_copy_device(y.idx_keys, ik, kIndexDim * 2, dp + 1, ratio, max_seq + 1, st);
         }
         if (is_kv_source(l)) cur_index_k = y.idx_keys;
+        if(tensor && is_kv_source(l)) tensor->barrier(tensor_rank,1000+l,st);
         fp8_linear(qr, y.idx_wq_b, iq);
         ops::rope_device(iq, kIndexHeads, kIndexDim, rope_yarn, dp + 1, 0, false, st);
         ops::fp4_quant_inplace(iq, kIndexHeads * kIndexDim, 32, false, st);
@@ -1332,8 +1389,11 @@ struct Engine::Impl {
         ck(cudaEventRecord(kv_join, st_kv), "kv join");
         fp8_linear(xa, y.wq_a, qr);
         ops::rmsnorm(qr, y.q_norm, qr, kQLora, kNormEps, 1, st);
-        fp8_linear(qr, y.wq_b, q);
-        ops::rope_device(q, kHeads, kHeadDim, rope, dp + 1, 0, false, st);
+        if(tensor) projection(qr,y.wq_b.exl3,q,nullptr,1,y.wq_b.k,y.wq_b.n,
+                              dense_ws,dense_workspace_bytes,st,false);
+        else fp8_linear(qr, y.wq_b, q);
+        const int first_head=tensor?tensor_rank*(kHeads/2):0, heads=tensor?kHeads/2:kHeads;
+        ops::rope_device(q+first_head*kHeadDim,heads,kHeadDim,rope,dp+1,0,false,st);
         ck(cudaStreamWaitEvent(st, kv_join, 0), "kv join wait");
         // idx_dev holds the window part for the whole step (window_index_device at step start)
         if (y.ratio > 0) {
@@ -1342,27 +1402,33 @@ struct Engine::Impl {
             if (have_latent) {
                 ops::rope_device(latent, 1, kHeadDim, rope_yarn, dp + 1, 1 - ratio, false, st);
                 ops::fp4_quant_inplace(latent, kHeadDim, 16, true, st);
-                ops::row_copy_device(y.comp, latent, kHeadDim * 2, dp + 1, ratio, max_seq + 1, st);   // row pos / ratio
+                if(owns_cache()) ops::row_copy_device(y.comp, latent, kHeadDim * 2, dp + 1, ratio, max_seq + 1, st);
             }
+            if(tensor && is_kv_source(l)) tensor->barrier(tensor_rank,960+l,st);
             // n_idx = 128 + min(512, (pos + 1) / ratio): this group's index source wrote them (none yet: 0)
             kernels::sparse_attn_decode_device(q, y.window, cur_comp, idx_dev, ratio == 1 ? dp + 2 : dp + 3, y.sink,
-                                               (float) std::pow(kHeadDim, -0.5), o, st);
+                                                (float) std::pow(kHeadDim, -0.5), o, st,first_head,heads);
         } else {
             kernels::sparse_attn_decode(q, y.window, nullptr, idx_dev, 1, kWindow, y.sink,
-                                        (float) std::pow(kHeadDim, -0.5), o, st);
+                                         (float) std::pow(kHeadDim, -0.5), o, st,first_head,heads);
         }
-        ops::rope_device(o, kHeads, kHeadDim, rope, dp + 1, 0, true, st);
+        ops::rope_device(o+first_head*kHeadDim,heads,kHeadDim,rope,dp+1,0,true,st);
 #ifdef STRATA_DS41_1017
         // 1017 model.py: block-32 FP8 quantize/dequantize before grouped wo_a.
-        ops::act_quant_inplace(o, kHeads * kHeadDim, st);
+        ops::act_quant_inplace(o+first_head*kHeadDim,heads*kHeadDim,st);
 #endif
-        if (y.wo_a_exl3[0].trellis) {
+        if (y.wo_a_exl3[tensor?tensor_rank*(kOGroups/2):0].trellis) {
             for (int group = 0; group < kOGroups; ++group)
-                exl3_linear(o + group * (kHeads * kHeadDim / kOGroups), y.wo_a_exl3[group],
-                            oa + group * kOLora, nullptr, dense_ws, dense_workspace_bytes, st);
+                if(!tensor || group/(kOGroups/2)==tensor_rank)
+                    projection(o + group * (kHeads * kHeadDim / kOGroups), y.wo_a_exl3[group],
+                           oa + group*kOLora,nullptr,1,kHeads*kHeadDim/kOGroups,kOLora,dense_ws,dense_workspace_bytes,st);
         } else if (y.wo_a8.w) wo_a_grouped_fp8(o, y.wo_a8.w, y.wo_a8.s, oa, st);
         else ops::wo_a_grouped(o, y.wo_a, oa, st);
-        fp8_linear(oa, y.wo_b, attn_out);
+        if(tensor) {
+            tensor->gather(tensor_rank,700+l,oa,1,kOGroups*kOLora,2,st,0,false);
+            projection(oa,y.wo_b.exl3,attn_out,nullptr,1,y.wo_b.k,y.wo_b.n,
+                       dense_ws,dense_workspace_bytes,st,true,false);
+        } else fp8_linear(oa, y.wo_b, attn_out);
     }
 
     // ------------------------------------------------------------------------------------- moe
@@ -1378,7 +1444,7 @@ struct Engine::Impl {
         const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
         // prefetch: layer l's guesses were planned and copied during layer l - 1 (none for layer 0)
         const bool pf = prefetch && ram && zc_blobs;
-        if (partitioned()) {
+        if (resident_backend()) {
             ops::resident_routes(ids, vram->res_dev() + (size_t) l * kExperts, gpu_sel, st);
         } else db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
                     (uint32_t) (l + 1), st, tier ? vram->experts_dev() : nullptr, ram,
@@ -1404,9 +1470,17 @@ struct Engine::Impl {
         if (staged) zc_stage->fork_copy(st);
         ck(cudaMemsetAsync(routed, 0, kDim * sizeof(float), st), "routed");
         if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
-        if (!staged && (tier || ram))
+        if (tensor) {
+            kernels::exl3_moe_tensor_up(reinterpret_cast<const __half*>(x_half_dev),1,gpu_sel,w,kTopK,
+                                        vram->experts_dev(),vram->workspace(),VramExperts::kWorkspaceBytes,tensor_rank,st);
+            tensor->gather(tensor_rank,768+2*l,kernels::exl3_moe_tensor_hidden(vram->workspace(),1,kTopK),
+                           kTopK,kMoeInter,2,st,0,false);
+            kernels::exl3_moe_tensor_down(1,gpu_sel,kTopK,vram->experts_dev(),routed,vram->workspace(),
+                                          VramExperts::kWorkspaceBytes,tensor_rank,st);
+            tensor->gather(tensor_rank,769+2*l,routed,1,kDim,4,st,0,false);
+        } else if (!staged && (tier || ram))
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK,
-                                      partitioned() ? vram->experts_dev() : db->gpu_experts(), routed,
+                                      resident_backend() ? vram->experts_dev() : db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
         // One K10 call preserves route reduction order.
         if (staged) {
@@ -1414,7 +1488,7 @@ struct Engine::Impl {
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
                                      vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
         }
-        if (!partitioned()) db->wait_add(routed, 1, (uint32_t) (l + 1), st);
+        if (!resident_backend()) db->wait_add(routed, 1, (uint32_t) (l + 1), st);
         // layer l + 1's guesses are read by its publish, and the next layer overwrites xf, which they read
         if (pf && l + 1 < kLayers) prefetch->ready(l + 1, st);
         ck(cudaStreamWaitEvent(st, sh_done, 0), "shared join");
@@ -2319,7 +2393,7 @@ struct Engine::Impl {
         if (stage.begin == 18) cur_comp = incoming_comp;
         ck(cudaMemcpyAsync(dp, hp, sizeof(StepParams), cudaMemcpyHostToDevice, st), "step params");
         ops::window_index_device(dp + 1, idx_dev, st);
-        if (stage.begin == 0) ops::embed_device(embed, dp, h, st);
+        if (stage.begin == 0) embedding(dp,1,1,h,st);
         if (n_eng) engram_kv();
         // the stream's collapse weights: one-hot at the first layer, then the previous layer's ffn_pre. Read in place:
         // a 16-byte copy node per layer left a 12-24 us gap on the GPU chain (nsys, RTX 5090 Laptop)
@@ -2360,7 +2434,7 @@ struct Engine::Impl {
             ops::hc_pre(h, pre_in, final_x, 1, st);
             ops::rmsnorm(final_x, final_norm, final_x, kDim, kNormEps, 1, st);
             if (head_exl3.trellis)
-                exl3_linear(final_x, head_exl3, nullptr, logits, dense_ws, dense_workspace_bytes, st);
+                projection(final_x,head_exl3,nullptr,logits,1,kDim,kVocab,dense_ws,dense_workspace_bytes,st,true,!tensor);
             else ops::bf16_linear(final_x, nullptr, head, kDim, kVocab, nullptr, logits, st);
             ops::argmax_logits(logits, d_next, st);
             ck(cudaMemcpyAsync(hp_next, d_next, sizeof(int), cudaMemcpyDeviceToHost, st), "next token");
@@ -2418,6 +2492,19 @@ struct Engine::Impl {
                 c += n;
             }
         }
+        std::vector<std::pair<void*,size_t>> draft_regions;
+        ds_slot_regions(draft_regions);
+        size_t bytes=0;for(const auto& region:draft_regions) bytes+=region.second;
+        if(to_slot) sn.draft.resize(bytes);
+        else if(sn.draft.size()!=bytes) throw std::logic_error("snapshot draft-state size mismatch");
+        size_t offset=0;
+        for(const auto& region:draft_regions) {
+            ck(cudaMemcpyAsync(to_slot?static_cast<void*>(sn.draft.data()+offset):region.first,
+                               to_slot?region.first:static_cast<const void*>(sn.draft.data()+offset),
+                               region.second,to_slot?cudaMemcpyDeviceToHost:cudaMemcpyHostToDevice,st),"snapshot draft state");
+            offset+=region.second;
+        }
+        ds_slot_pending(sn.draft_n,sn.draft_pos0,to_slot);
         ck(cudaStreamSynchronize(st), "snapshot");
     }
 
@@ -2441,7 +2528,6 @@ struct Engine::Impl {
         verify_pending = verify_failed = false;
         snapshot_copy(sn, false);
         history.resize(sn.pos);
-        if (ds) ds_set_pending(0, 0);   // DSpark's rings are not in the snapshot: stale rows cost draft quality only
         return sn.pos;
     }
 
@@ -2483,7 +2569,7 @@ struct Engine::Impl {
         worker_ram = worker_file = worker_ssd = 0;
         worker_prefetched = 0;
         worker_skipped = 0;
-        if (!partitioned()) {
+        if (!resident_backend()) {
             std::lock_guard<std::mutex> lk(mu);
             job_db = db.get();
             job_m = 1;
@@ -2537,7 +2623,7 @@ struct Engine::Impl {
         if (stage.end == kLayers) lg.assign(lg_pinned, lg_pinned + kVocab);
         if (ds) dspark_pend(ds_step_mh(), 1, pos);
         if (pred_stats && lookahead) predict_tally();
-        if (vram && !partitioned()) vram->count(routes_pinned, kTopK);
+        if (vram && !resident_backend()) vram->count(routes_pinned, kTopK);
         if (host && host->reserve() > 0) host->end_step(routes_pinned, kTopK);   // publish this step's reads, evict
         if (dump) {
             float wv[kLayers * kTopK];
@@ -2557,7 +2643,7 @@ struct Engine::Impl {
         }
         tm.total_ms = now_ms() - t_start;
         tm.end_ms = now_ms() - t_end;
-        tm.worker_lead_ms = partitioned() ? 0 : worker_wake_at.load() - t_start;
+        tm.worker_lead_ms = resident_backend() ? 0 : worker_wake_at.load() - t_start;
         tm.worker_span_ms = worker_end_at.load() - worker_wake_at.load();
         tm.worker_wait_ms = worker_wait.load();
         tm.worker_first_wait_ms = worker_first_wait.load();
@@ -2607,6 +2693,20 @@ Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) {
     ck(cudaGetDeviceCount(&count), "device count");
     for (const auto& range : ranges)
         if (range.device >= count) throw std::invalid_argument("DeepSeek split device is not visible to CUDA");
+    if(opt.tensor_parallel) {
+        tensor_=std::make_shared<TensorParallel>(opt.devices);
+        impl_.reset(new Impl(pack_dir,opt,{opt.devices[0],0,kLayers}));
+        tail_.reset(new Impl(pack_dir,opt,{opt.devices[1],0,kLayers}));
+        impl_->tensor=tail_->tensor=tensor_;impl_->tensor_rank=0;tail_->tensor_rank=1;
+        size_t free[2],total=0;
+        { DeviceScope scope(opt.devices[0]);ck(cudaMemGetInfo(&free[0],&total),"TP2 cache placement"); }
+        { DeviceScope scope(opt.devices[1]);ck(cudaMemGetInfo(&free[1],&total),"TP2 cache placement"); }
+        if(free[0]>=free[1]) { tail_->tensor_cache_source=impl_.get();impl_->init();tail_->init(); }
+        else { impl_->tensor_cache_source=tail_.get();tail_->init();impl_->init(); }
+        std::fprintf(stderr,"ds41: TP2 CUDA%d + CUDA%d, sharded EXL3 dense/experts and attention heads, all layers on both ranks; bounded peer mailboxes, strict routing\n",
+                     opt.devices[0],opt.devices[1]);
+        return;
+    }
     impl_.reset(new Impl(pack_dir, opt, ranges[0]));
     tail_.reset(new Impl(pack_dir, opt, ranges[1]));
     impl_->init();
@@ -2614,7 +2714,7 @@ Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) {
     impl_->handoff = std::make_unique<StageTransfer>(ranges[0].device, ranges[1].device,
                                                     kHc * kDim * sizeof(bf16), opt.force_host_handoff);
     std::fprintf(stderr, "ds41: resident split CUDA%d layers 0-%d -> CUDA%d layers %d-39, %s handoff; "
-                         "strict backbone routing, no CPU experts; bounded prefill and replay verification\n",
+                         "strict backbone routing, no CPU experts; bounded prefill and batched prefix verification\n",
                  ranges[0].device, opt.split_layer - 1, ranges[1].device, opt.split_layer,
                  impl_->handoff->peer() ? "peer" : "pinned-host");
 }
@@ -2628,6 +2728,7 @@ Engine::Engine(const std::string& pack_dir, int max_seq, int cpu_threads)
       }()) {}
 
 int Engine::vram_expert_slots() const {
+    if(tensor_) return impl_->vram ? impl_->vram->slots() : 0;
     return (impl_->vram ? impl_->vram->slots() : 0) + (tail_ && tail_->vram ? tail_->vram->slots() : 0);
 }
 
@@ -2644,6 +2745,16 @@ int Engine::step(int token, int pos, StepDump* dump) {
         throw std::invalid_argument("DeepSeek split: token position must match both stages and fit max_seq");
     const double start = now_ms();
     try {
+        if(tensor_) {
+            Timing times[2];int next[2];
+            tensor_both(tensor_,[&](int rank) {
+                auto& e=rank?*tail_:*impl_;
+                next[rank]=e.step(token,pos,rank?nullptr:dump,times[rank]);
+            });
+            if(next[0]!=next[1]) throw std::runtime_error("TP2 ranks returned different next tokens");
+            timing_=times[0];timing_.total_ms=timing_.gpu_ms=now_ms()-start;
+            return next[0];
+        }
         Timing first, last;
         impl_->step(token, pos, dump, first);
         impl_->handoff->copy_state(tail_->h, impl_->h, tail_->ffn_pre, impl_->ffn_pre, impl_->st, tail_->st);
@@ -2687,6 +2798,27 @@ int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>*
         throw std::invalid_argument("DeepSeek split: empty, out-of-order or oversized prefill");
     for (int token : tokens) Impl::check_token(token);
     prefill_timing_ = PrefillTiming{};
+    if(tensor_) {
+        const double start=now_ms();int next=-1;
+        if(nll) nll->assign(tokens.size()-1,0.0f);
+        try {
+            for(size_t off=0;off<tokens.size();) {
+                const size_t rows=impl_->opt.prefill_chunk>0 ? std::min<size_t>(kVerifyMaxTokens,tokens.size()-off) : 1;
+                std::vector<int> window(tokens.begin()+off,tokens.begin()+off+rows);
+                const auto checked=verify(window,pos+int(off),nll!=nullptr);
+                if(nll) for(size_t r=0;r<rows && off+r+1<tokens.size();++r) {
+                    const auto& logits=checked.logits[r];const double top=*std::max_element(logits.begin(),logits.end());
+                    double sum=0;for(float value:logits) sum+=std::exp(value-top);
+                    (*nll)[off+r]=float(top+std::log(sum)-logits[tokens[off+r+1]]);
+                }
+                next=checked.next.back();commit(int(rows));off+=rows;
+                ++prefill_timing_.chunks;prefill_timing_.vram_experts+=rows*kLayers*kTopK;
+                if(impl_->progress && !impl_->progress(int(off),int(tokens.size()))) throw PrefillCancelled();
+            }
+        } catch(const PrefillCancelled&) { reset();throw; }
+        prefill_timing_.chunk_tokens=prefill_timing_.sub_batch=kVerifyMaxTokens;
+        prefill_timing_.total_ms=now_ms()-start;return next;
+    }
     if (impl_->opt.prefill_chunk > 0 && !nll) {
         const double start = now_ms();
         bool started = false;

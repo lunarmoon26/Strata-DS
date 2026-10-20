@@ -18,6 +18,7 @@
 #include <vector>
 
 namespace strata::ds41 {
+class TensorParallel;
 
 struct StepDump {
     std::vector<uint16_t> hidden;                    ///< [40][4][5120] bf16 bits: the hc stream after each block
@@ -27,8 +28,10 @@ struct StepDump {
 };
 
 struct EngineOptions {
-    /// Empty: existing single-device path. Two devices: resident split at split_layer.
+    /// Resident deployment requires two devices. tensor_parallel selects TP2;
+    /// otherwise they own layer ranges separated by split_layer.
     std::vector<int> devices;
+    bool tensor_parallel = false;             ///< TP2 output-channel sharding, not the layer split
     int split_layer = 20;                    ///< 18 mirrors layer-14 compressed KV and selected indices
     bool force_host_handoff = false;         ///< validation: exercise bounded pinned fallback without peer copies
     int max_seq = 4096;
@@ -54,6 +57,7 @@ struct EngineOptions {
     /// from VRAM tier slots lent for the call (upstream), else from cudaMalloc.
     /// Resident full-EXL3 split: bounded chunks <=1024 and sub-batches <=512,
     /// separate scratch, no expert eviction/streaming. 0 keeps token-by-token.
+    /// TP2 uses <=4 tentative rows per chunk with a direct prefix commit.
     int prefill_chunk = 65536;
     int prefill_batch = 4096;   ///< sub-batch tokens (halved down to 512 when the scratch does not fit)
     int prefill_ring = 256;     ///< expert ring slots at most (halved down to 16 when they do not fit)
@@ -69,10 +73,13 @@ struct EngineOptions {
     /// into RAM before the RAM tier sizes itself, and step, verify and prefill keep its input (the attention input of
     /// layers 37-39). Off: none of that.
     bool dspark = false;
+    size_t draft_cache_bytes = 1ull << 30; ///< bounded GPU LRU for published MTP experts, never backbone eviction
     int prefill_threads = 16;       ///< expert stream readers (pread from the pack)
     int prefill_host_buffers = 64;  ///< pinned staging buffers of the expert stream (how far reads run ahead)
 
     void validate_split() const {
+        if (tensor_parallel && (devices.size()!=2 || force_host_handoff || split_layer!=20))
+            throw std::invalid_argument("TP2 requires two peer-accessible devices, no --split-layer and no forced host handoff");
         if (devices.empty()) {
             if (split_layer != 20) throw std::invalid_argument("--split-layer requires --devices");
             return;
@@ -151,9 +158,8 @@ public:
     /// Tokens fed so far: the position of the next step or prefill
     int position() const;
 
-    /// Save the state at the current position in `slot` (0 .. snapshot_slots() - 1). Only the state that the position
-    /// does not determine is copied (the window rings and the compressor states); the compressed rows are written
-    /// before they are read, so they need no copy.
+    /// Save the state at the current position in `slot` (0 .. snapshot_slots() - 1). Window rings, compressor state,
+    /// and optional draft rings/pending rows are copied; compressed rows are written before being read and need no copy.
     void save_snapshot(int slot);
     /// Go back to the position saved in `slot`; returns it. The caller makes sure that the tokens fed before that
     /// position are still the ones fed when it was saved. Refused when the slot is empty or past position(). A pending
@@ -210,6 +216,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::unique_ptr<Impl> tail_;
+    std::shared_ptr<TensorParallel> tensor_;
     Timing timing_;
     PrefillTiming prefill_timing_;
     bool split_verify_pending_ = false;

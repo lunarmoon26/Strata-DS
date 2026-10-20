@@ -17,7 +17,7 @@ or an Apple Silicon Mac. Version 0.2.0-beta, engine 0.1.45.3. It has three parts
 This fork also carries an **opt-in experimental resident DeepSeek 1017 backend**.
 Follow [docs/DEEPSEEK_1017.md](docs/DEEPSEEK_1017.md) for that profile, not the
 Terminal's Qwen download workflow below. It reuses existing pinned EXL3 assets,
-requires two resident CUDA stages, and supports configure-only installation.
+requires two resident CUDA devices (layer split or opt-in TP2), and supports configure-only installation.
 Do not download or requantize weights, start another model-sized GPU process,
 or replace the existing serving checkout to validate this candidate.
 

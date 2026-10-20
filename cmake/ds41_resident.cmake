@@ -9,7 +9,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/expert_staging.cu src/ds41/expert_prefetch.cu src/ds41/vram_experts.cu
   src/ds41/engram_rows.cpp src/ds41/host_experts.cpp src/ds41/lookahead.cpp
   src/ds41/expert_stream.cpp src/ds41/wo_a_fp8.cu src/ds41/dspark_ops.cu
-  src/ds41/engine.cu src/ds41/resident_cpu_guard.cpp src/platform/direct_file.cpp
+  src/ds41/engine.cu src/ds41/resident_cpu_guard.cpp src/platform/direct_file.cpp src/ds41/tensor_parallel.cu
   src/ds41/kernels/fp8_gemv.cu src/ds41/kernels/k2_fp8_gemm.cu
   src/ds41/kernels/k3_sparse_attn.cu src/ds41/kernels/k5_indexer.cu
   src/ds41/kernels/k7_hc.cu src/ds41/kernels/k8_router.cu
@@ -38,15 +38,16 @@ endforeach()
 option(STRATA_DS41_STAGE_TESTS "Build resident 1017 component/model tests (never run automatically)" OFF)
 if(STRATA_DS41_STAGE_TESTS)
   enable_testing()
-  foreach(test stage_plan suffix_drafter serve_request)
+  foreach(test stage_plan suffix_drafter serve_request serve_input)
     add_executable(ds41_${test}_test src/ds41/tests/${test}_test.cpp)
-    target_link_libraries(ds41_${test}_test PRIVATE strata_ds41_suffix)
+    target_link_libraries(ds41_${test}_test PRIVATE strata_ds41_suffix Threads::Threads)
     add_test(NAME ds41_${test} COMMAND ds41_${test}_test)
   endforeach()
+  set_tests_properties(ds41_serve_input PROPERTIES TIMEOUT 10)
   add_executable(ds41_resident_policy_test src/ds41/tests/resident_policy_test.cpp)
   target_link_libraries(ds41_resident_policy_test PRIVATE strata_ds41_engine)
   add_test(NAME ds41_resident_policy COMMAND ds41_resident_policy_test)
-  foreach(test stage_transfer stage_upload mcg_decode mcg_pack exl3_linear)
+  foreach(test stage_transfer stage_upload mcg_decode mcg_pack exl3_linear tensor_parallel tensor_expert tensor_attention)
     add_executable(ds41_${test}_test src/ds41/tests/${test}_test.cu)
     target_link_libraries(ds41_${test}_test PRIVATE strata_ds41_engine)
     add_test(NAME ds41_${test} COMMAND ds41_${test}_test)
@@ -60,7 +61,7 @@ if(STRATA_DS41_STAGE_TESTS)
   target_link_libraries(ds41_exl3_prefill_experts_test PRIVATE strata_ds41_engine)
   add_test(NAME ds41_exl3_prefill_experts COMMAND ds41_exl3_prefill_experts_test --component-only)
   set_tests_properties(ds41_exl3_prefill_experts PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
-  foreach(test stage_model_smoke stage_prefill_model stage_serving_model)
+  foreach(test stage_model_smoke stage_prefill_model stage_serving_model speculation_model)
     add_executable(ds41_${test}_test src/ds41/tests/${test}_test.cpp)
     target_link_libraries(ds41_${test}_test PRIVATE strata_ds41_engine)
   endforeach()

@@ -25,6 +25,7 @@
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/engine.hpp"
 #include "strata/ds41/serve_request.hpp"
+#include "strata/ds41/serve_input.hpp"
 #include "strata/ds41/suffix_drafter.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -33,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -127,53 +129,7 @@ private:
     int* out_ = nullptr;
 };
 
-/// stdin on its own thread (upstream): STOP is seen while a request runs, everything else is queued
-struct Input {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<std::string> lines;
-    bool eof = false;
-    std::atomic<bool> stop{false};
-
-    void start() {
-        std::thread([this] {
-            std::string l;
-            while (std::getline(std::cin, l)) {
-                if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") {
-                    stop.store(true);
-                    continue;
-                }
-                std::lock_guard<std::mutex> lk(mu);
-                lines.push_back(l);
-                cv.notify_one();
-            }
-            std::lock_guard<std::mutex> lk(mu);
-            eof = true;
-            cv.notify_one();
-        }).detach();
-    }
-    bool next(std::string& out) {
-        std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&] { return !lines.empty() || eof; });
-        if (lines.empty()) return false;
-        out = std::move(lines.front());
-        lines.pop_front();
-        return true;
-    }
-    /// a waiting line, without blocking (batch slots decode while nothing arrives)
-    bool poll(std::string& out) {
-        std::lock_guard<std::mutex> lk(mu);
-        if (lines.empty()) return false;
-        out = std::move(lines.front());
-        lines.pop_front();
-        return true;
-    }
-    bool ended() {
-        std::lock_guard<std::mutex> lk(mu);
-        return eof && lines.empty();
-    }
-};
+using Input = strata::ds41::serve::Input;
 
 struct Options {
     std::string pack;
@@ -196,6 +152,7 @@ struct Options {
                  "       [--prefill-batch N] [--prefill-ring N] [--prefill-threads N] [--window-prompt-max N]\n"
                   "       [--snapshots N] [--batch N] [--spec none|suffix|dspark]\n"
                   "       [--devices 0,1 --ram-budget-gib 0 --adapt-every 0 --prefill-chunk 0]\n"
+                  "       [--parallelism layer|tensor] [--draft-cache-mib 1024]\n"
                  "       [--eos-id ID ...]\n",
                  why.c_str());
     std::exit(2);
@@ -235,6 +192,11 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--adapt-every") o.eng.adapt_every = (int) num(next());
         else if (a == "--adapt-swaps") o.eng.adapt_swaps = (int) num(next());
         else if (a == "--split-layer") o.eng.split_layer = (int) num(next());
+        else if (a == "--parallelism") {
+            const auto mode=next();
+            if(mode!="layer" && mode!="tensor") usage("--parallelism must be layer or tensor");
+            o.eng.tensor_parallel=mode=="tensor";
+        }
         else if (a == "--prefill-chunk") o.eng.prefill_chunk = (int) num(next());
         else if (a == "--prefill-batch") o.eng.prefill_batch = (int) num(next());
         else if (a == "--prefill-ring") o.eng.prefill_ring = (int) num(next());
@@ -243,6 +205,11 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--snapshots") o.eng.snapshots = (int) num(next());
         else if (a == "--batch") o.eng.batch_slots = (int) num(next());
         else if (a == "--spec") o.spec = next();
+        else if (a == "--draft-cache-mib") {
+            const double mib=num(next());
+            if(mib<0 || mib>8192 || std::floor(mib)!=mib) usage("--draft-cache-mib must be an integer in 0..8192");
+            o.eng.draft_cache_bytes=size_t(mib)<<20;
+        }
         else if (a == "--eos-id") {
             if (!eos_given) o.eos.clear();
             eos_given = true;

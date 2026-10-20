@@ -6,7 +6,7 @@ void Engine::Impl::alloc_slots() {
     const int n = std::max(0, std::min(opt.batch_slots, kVerifyMaxTokens));
     if (n == 0) return;
     slot_states.resize(n);
-    if (partitioned()) {
+    if (resident_backend()) {
         slot_states.resize(n + 1); // one private save area preserves the main session during serial scheduling
         std::fprintf(stderr, "ds41: %d isolated split session slots; serial GPU scheduling, actual-size host KV state\n", n);
         return;
@@ -48,7 +48,7 @@ void Engine::Impl::slot_copy(int slot, bool to_slot) {
     if (verify_pending) throw std::logic_error("commit the pending verify window first");
     auto& s = slot_states[slot];
     const int pos = (int) (to_slot ? history : s.history).size();
-    if (partitioned()) {
+    if (resident_backend()) {
         // Optional session state grows with actual tokens, never with weights.
         // One shared GPU cache is scheduled serially; experts never leave VRAM.
         std::vector<std::pair<void*, size_t>> regions;
@@ -57,7 +57,7 @@ void Engine::Impl::slot_copy(int slot, bool to_slot) {
             regions.push_back({y.window, size_t(kWindow) * kHeadDim * 2});
             if (!is_kv_source(l)) continue;
             const size_t rows = size_t(pos / y.ratio);
-            if (rows) {
+            if (rows && owns_cache()) {
                 regions.push_back({y.comp, rows * kHeadDim * 2});
                 regions.push_back({y.idx_keys, rows * kIndexDim * 2});
             }

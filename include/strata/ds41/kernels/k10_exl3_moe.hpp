@@ -17,6 +17,7 @@ struct Exl3Proj {
     const __half* svh;
     int k, n, tile_w;
     int codebook = 2;  ///< 2: original mul1; 1: MCG (resident split K2 only)
+    int shard_rank = 0, shard_count = 1, collective_slot = -1;
 };
 /// One routed expert: w1 (gate, 5120 -> 2304), w3 (up, 5120 -> 2304), w2 (down, 2304 -> 5120).
 struct Exl3Expert {
@@ -34,6 +35,14 @@ struct Exl3Expert {
 /// out [m][5120] f32 is accumulated into. workspace: device memory of workspace_bytes (at least 64 MiB).
 /// No allocation, no synchronization (CUDA-graph capturable).
 void exl3_moe_decode(const __half* x, int m, const int32_t* sel, const float* w, int topk, const Exl3Expert* experts,
-                     float* out, void* workspace, size_t workspace_bytes, cudaStream_t stream);
+                      float* out, void* workspace, size_t workspace_bytes, cudaStream_t stream);
+
+/// Column-sharded TP2 experts. Gather hidden rows between up/down, then gather
+/// the output rows. Both operations preserve FP16 activation and FP32 reduction.
+void exl3_moe_tensor_up(const __half* x, int m, const int32_t* sel, const float* weights, int topk,
+                        const Exl3Expert* experts, void* workspace, size_t bytes, int rank, cudaStream_t stream);
+void* exl3_moe_tensor_hidden(void* workspace, int m, int topk);
+void exl3_moe_tensor_down(int m, const int32_t* sel, int topk, const Exl3Expert* experts,
+                          float* out, void* workspace, size_t bytes, int rank, cudaStream_t stream);
 
 }  // namespace strata::ds41::kernels

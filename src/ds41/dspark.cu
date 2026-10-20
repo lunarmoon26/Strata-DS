@@ -60,7 +60,15 @@ struct Engine::Impl::Dspark {
     std::unique_ptr<BoundedUpload> published_experts;
     uint8_t* published_slot = nullptr;
     kernels::Exl3Expert* published_desc = nullptr;
+    void* dense = nullptr;
+    size_t dense_bytes = 0, cache_bytes = 0, cache_limit = 0;
+    uint64_t cache_clock = 0;
+    struct Cached { uint8_t* data; size_t bytes; kernels::Exl3Expert desc; uint64_t used; };
+    std::map<int,Cached> published_cache;
+    int cache_hits = 0;
+    uint64_t cache_hit_mask = 0; // one bit per routed draft use, for exact TP intersection
     ~Dspark() {
+        for(auto& [id,entry]:published_cache) cudaFree(entry.data);
         for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
         for (int64_t hnd : moe)
             if (hnd >= 0) exl3_moe_cpu_free_layer(hnd);
@@ -180,6 +188,8 @@ void Engine::Impl::dspark_init() {
        "dspark routes");
     if (const char* f = std::getenv("DS41_DSPARK_PROFILE")) d.profile_path = f;
     if (pack.has_exl3_dense()) {
+        d.dense_bytes=exl3_small_rows_workspace_bytes(8,32768,kVocab);
+        d.dense=d.alloc<uint8_t>(d.dense_bytes);
         d.published_experts = std::make_unique<BoundedUpload>(pack.dir() + "/mtp_experts.bin");
         size_t largest = 0;
         for (int s = 0; s < dsk::kStages; ++s)
@@ -189,7 +199,7 @@ void Engine::Impl::dspark_init() {
                 largest = std::max<size_t>(largest, x.bytes);
             }
         d.published_slot = d.alloc<uint8_t>(largest);
-        d.published_desc = d.alloc<kernels::Exl3Expert>(1);
+        d.published_desc = d.alloc<kernels::Exl3Expert>(B*dsk::kTopK);
         d.vws = d.alloc<uint8_t>(VramExperts::kWorkspaceBytes);
         ck(cudaMemset(d.sel, 0, sizeof(int32_t)), "draft selected expert");
         std::fprintf(stderr, "ds41: published EXL3 DSpark, bounded single-expert GPU staging (%zu bytes); no CPU/requantization\n", largest);
@@ -308,12 +318,17 @@ void Engine::Impl::dspark_ring(int n, cudaStream_t s) {
     auto& d = *ds;
     for (int c0 = 0; c0 < n; c0 += 8) {
         const int mc = std::min(8, n - c0);
-        for (int r = 0; r < mc; ++r)
+        if(d.main_proj.exl3.trellis)
+            projection(d.mh+size_t(c0)*Dspark::kHid,d.main_proj.exl3,d.mx,nullptr,mc,Dspark::kHid,kDim,
+                       d.dense,d.dense_bytes,s);
+        else for (int r = 0; r < mc; ++r)
             fp8_linear_on(d.mh + size_t(c0 + r) * Dspark::kHid, d.main_proj, d.mx + r * kDim, d.act, s);
         ops::rmsnorm(d.mx, d.main_norm, d.mx, kDim, kNormEps, mc, s);
         for (int st_i = 0; st_i < dsk::kStages; ++st_i) {
             auto& y = d.S[st_i];
-            for (int r = 0; r < mc; ++r)
+            if(y.wkv.exl3.trellis)
+                projection(d.mx,y.wkv.exl3,d.mkv,nullptr,mc,kDim,kHeadDim,d.dense,d.dense_bytes,s);
+            else for (int r = 0; r < mc; ++r)
                 fp8_linear_on(d.mx + r * kDim, y.wkv, d.mkv + r * kHeadDim, d.act, s);
             ops::rmsnorm(d.mkv, y.kv_norm, d.mkv, kHeadDim, kNormEps, mc, s);
             for (int r = 0; r < mc; ++r) {
@@ -337,7 +352,7 @@ void Engine::Impl::enqueue_draft(int n_pend) {
     if (n_pend > 0) dspark_ring(n_pend, st);
     auto lin = [&](const bf16* x, const Fp8& w, bf16* y) {
         if (w.exl3.trellis) {
-            for (int r = 0; r < B; ++r) fp8_linear_on(x + r * w.k, w, y + r * w.n, d.act, st);
+            projection(x,w.exl3,y,nullptr,B,w.k,w.n,d.dense,d.dense_bytes,st);
             return;
         }
         fp8_quantize_activation_f32((const uint16_t*) x, B, w.k, d.act, st);
@@ -345,7 +360,7 @@ void Engine::Impl::enqueue_draft(int n_pend) {
     };
     dsk::block_index(d.prm + 10, d.idx, st);
     for (int r = 0; r < B; ++r) {
-        if (!partitioned()) ops::embed_device(embed, d.prm + r, d.h + (size_t) r * kHc * kDim, st);
+        if (!partitioned()) embedding(d.prm+r,1,1,d.h+size_t(r)*kHc*kDim,st);
         ck(cudaMemcpyAsync(d.mix + r * kHc, one_hot_dev, kHc * sizeof(float), cudaMemcpyDeviceToDevice, st), "dspark mix");
     }
     for (int s = 0; s < dsk::kStages; ++s) {
@@ -373,11 +388,9 @@ void Engine::Impl::enqueue_draft(int n_pend) {
         ops::act_quant_inplace(d.o, B * kHeads * kHeadDim, st);
 #endif
         if (y.wo_a_exl3[0].trellis) {
-            for (int r = 0; r < B; ++r)
-                for (int g = 0; g < kOGroups; ++g)
-                    exl3_linear(d.o + size_t(r) * kHeads * kHeadDim + g * (kHeads * kHeadDim / kOGroups),
-                                y.wo_a_exl3[g], d.oa + size_t(r) * kOGroups * kOLora + g * kOLora,
-                                nullptr, dense_ws, dense_workspace_bytes, st);
+            for (int g=0;g<kOGroups;++g)
+                projection(d.o+g*(kHeads*kHeadDim/kOGroups),y.wo_a_exl3[g],d.oa+g*kOLora,nullptr,
+                           B,kHeads*kHeadDim,kOGroups*kOLora,d.dense,d.dense_bytes,st);
         } else wo_a_grouped_fp8_rows(d.o, B, y.wo_a8.w, y.wo_a8.s, d.oa, st);
         lin(d.oa, y.wo_b, d.attn_out);
         ops::hc_post(d.attn_out, d.h, d.apost, d.acomb, d.h2, B, st);
@@ -401,16 +414,58 @@ void Engine::Impl::enqueue_draft(int n_pend) {
             int32_t selected[Dspark::B * dsk::kTopK];
             ck(cudaMemcpyAsync(selected, ids, sizeof selected, cudaMemcpyDeviceToHost, st), "draft routes");
             ck(cudaStreamSynchronize(st), "draft routes ready");
+            if(!d.cache_limit && opt.draft_cache_bytes) {
+                size_t free=0,total=0;ck(cudaMemGetInfo(&free,&total),"draft cache headroom");
+                d.cache_limit=std::min(opt.draft_cache_bytes,free>opt.vram_reserve_bytes?free-opt.vram_reserve_bytes:0);
+            }
+            std::vector<int> pinned(selected,selected+B*dsk::kTopK);
+            std::sort(pinned.begin(),pinned.end());pinned.erase(std::unique(pinned.begin(),pinned.end()),pinned.end());
+            size_t needed=0;
+            for(int expert:pinned) {
+                if(expert<0 || expert>=dsk::kExperts) throw std::runtime_error("invalid DSpark expert");
+                const auto& slot=pack.mtp_expert(s,expert);
+                needed+=tensor?tensor_expert_bytes(slot):size_t(slot.bytes);
+            }
+            bool batch=needed<=d.cache_limit;
+            if(tensor) batch=tensor->agree(batch);
+            kernels::Exl3Expert descriptors[B*dsk::kTopK];
+            if(!batch) ck(cudaMemsetAsync(d.sel,0,B*dsk::kTopK*sizeof(int32_t),st),"draft streaming selection");
             for (int r = 0; r < B; ++r) for (int j = 0; j < dsk::kTopK; ++j) {
                 const int e = selected[r * dsk::kTopK + j];
                 if (e < 0 || e >= dsk::kExperts) throw std::runtime_error("invalid DSpark expert");
                 const auto& x = pack.mtp_expert(s, e);
-                d.published_experts->copy(d.published_slot, x.offset, x.bytes);
+                const int key=s*dsk::kExperts+e;
+                auto cached=d.published_cache.find(key);
+                uint8_t* base=d.published_slot;
+                const size_t bytes=tensor ? tensor_expert_bytes(x) : size_t(x.bytes);
+                if(cached!=d.published_cache.end()) {
+                    base=cached->second.data;cached->second.used=++d.cache_clock;++d.cache_hits;
+                    d.cache_hit_mask |= uint64_t(1) << (s*B*dsk::kTopK+r*dsk::kTopK+j);
+                }
+                else {
+                    if(bytes<=d.cache_limit) {
+                        while(d.cache_bytes+bytes>d.cache_limit && !d.published_cache.empty()) {
+                            auto victim=d.published_cache.end();
+                            for(auto it=d.published_cache.begin();it!=d.published_cache.end();++it) {
+                                if(batch && it->first/dsk::kExperts==s &&
+                                   std::binary_search(pinned.begin(),pinned.end(),it->first%dsk::kExperts)) continue;
+                                if(victim==d.published_cache.end() || it->second.used<victim->second.used) victim=it;
+                            }
+                            if(victim==d.published_cache.end()) throw std::logic_error("draft cache pinned working set exceeds bound");
+                            ck(cudaFree(victim->second.data),"draft cache evict");d.cache_bytes-=victim->second.bytes;
+                            d.published_cache.erase(victim);
+                        }
+                        ck(cudaMalloc(&base,bytes),"draft cache allocate");
+                        cached=d.published_cache.emplace(key,Dspark::Cached{base,bytes,{},++d.cache_clock}).first;
+                        d.cache_bytes+=bytes;
+                    }
+                    if(!tensor) d.published_experts->copy(base,x.offset,x.bytes);
+                }
                 auto projection = [&](int c, int k, int n) {
                     kernels::Exl3Proj p{};
-                    p.trellis = reinterpret_cast<uint16_t*>(d.published_slot + x.comp_off[c]);
-                    p.suh = reinterpret_cast<__half*>(d.published_slot + x.comp_off[c + 1]);
-                    p.svh = reinterpret_cast<__half*>(d.published_slot + x.comp_off[c + 2]);
+                    p.trellis = reinterpret_cast<uint16_t*>(base + x.comp_off[c]);
+                    p.suh = reinterpret_cast<__half*>(base + x.comp_off[c + 1]);
+                    p.svh = reinterpret_cast<__half*>(base + x.comp_off[c + 2]);
                     p.k = k; p.n = n;
                     p.tile_w = int(x.comp_bytes[c] / (uint64_t(k / 16) * (n / 16) * 2));
                     return p;
@@ -418,11 +473,41 @@ void Engine::Impl::enqueue_draft(int n_pend) {
                 kernels::Exl3Expert desc{};
                 desc.w1 = projection(0, kDim, kMoeInter); desc.w3 = projection(4, kDim, kMoeInter);
                 desc.w2 = projection(8, kMoeInter, kDim); desc.native_qdq = false;
+                if(tensor) {
+                    if(cached!=d.published_cache.end() && cached->second.desc.w1.trellis) desc=cached->second.desc;
+                    else desc=upload_tensor_expert(*d.published_experts,x,base,tensor_rank);
+                }
+                if(cached!=d.published_cache.end()) cached->second.desc=desc;
+                descriptors[r*dsk::kTopK+j]=desc;
+                if(batch) continue;
                 ck(cudaMemcpyAsync(d.published_desc, &desc, sizeof desc, cudaMemcpyHostToDevice, st), "draft expert descriptor");
-                kernels::exl3_moe_decode(reinterpret_cast<const __half*>(d.half) + r * kDim, 1, d.sel,
+                if(tensor) {
+                    kernels::exl3_moe_tensor_up(reinterpret_cast<const __half*>(d.half)+r*kDim,1,d.sel,
+                                               d.weights+r*dsk::kTopK+j,1,d.published_desc,d.vws,
+                                               VramExperts::kWorkspaceBytes,tensor_rank,st);
+                    tensor->gather(tensor_rank,900+2*s,kernels::exl3_moe_tensor_hidden(d.vws,1,1),1,kMoeInter,2,st);
+                    kernels::exl3_moe_tensor_down(1,d.sel,1,d.published_desc,d.routed+r*kDim,d.vws,
+                                                 VramExperts::kWorkspaceBytes,tensor_rank,st);
+                    tensor->gather(tensor_rank,901+2*s,d.routed+r*kDim,1,kDim,4,st);
+                } else kernels::exl3_moe_decode(reinterpret_cast<const __half*>(d.half) + r * kDim, 1, d.sel,
                                          d.weights + r * dsk::kTopK + j, 1, d.published_desc,
                                          d.routed + r * kDim, d.vws, VramExperts::kWorkspaceBytes, st);
                 ck(cudaStreamSynchronize(st), "draft expert complete");
+            }
+            if(batch) {
+                int32_t selection[B*dsk::kTopK];
+                for(int i=0;i<B*dsk::kTopK;++i) selection[i]=i;
+                ck(cudaMemcpyAsync(d.published_desc,descriptors,sizeof descriptors,cudaMemcpyHostToDevice,st),"draft batched descriptors");
+                ck(cudaMemcpyAsync(d.sel,selection,sizeof selection,cudaMemcpyHostToDevice,st),"draft batched selection");
+                if(tensor) {
+                    kernels::exl3_moe_tensor_up(reinterpret_cast<const __half*>(d.half),B,d.sel,d.weights,dsk::kTopK,
+                                               d.published_desc,d.vws,VramExperts::kWorkspaceBytes,tensor_rank,st);
+                    tensor->gather(tensor_rank,900+2*s,kernels::exl3_moe_tensor_hidden(d.vws,B,dsk::kTopK),B*dsk::kTopK,kMoeInter,2,st);
+                    kernels::exl3_moe_tensor_down(B,d.sel,dsk::kTopK,d.published_desc,d.routed,d.vws,VramExperts::kWorkspaceBytes,tensor_rank,st);
+                    tensor->gather(tensor_rank,901+2*s,d.routed,B,kDim,4,st);
+                } else kernels::exl3_moe_decode(reinterpret_cast<const __half*>(d.half),B,d.sel,d.weights,dsk::kTopK,
+                                                d.published_desc,d.routed,d.vws,VramExperts::kWorkspaceBytes,st);
+                ck(cudaStreamSynchronize(st),"draft batched experts complete");
             }
         } else if (d.vslots)
             kernels::exl3_moe_decode((const __half*) d.half, B, d.sel, d.weights, dsk::kTopK, d.db->gpu_experts(),
@@ -436,9 +521,7 @@ void Engine::Impl::enqueue_draft(int n_pend) {
     ops::hc_pre(d.h, d.mix, d.xfin, B, st);
     ops::rmsnorm(d.xfin, d.norm, d.xn, kDim, kNormEps, B, st);
     if (pack.has_exl3_dense()) {
-        for (int r = 0; r < B; ++r)
-            exl3_linear(d.xn + r * kDim, head_exl3, nullptr, d.logits + size_t(r) * kVocab,
-                         dense_ws, dense_workspace_bytes, st);
+        projection(d.xn,head_exl3,nullptr,d.logits,B,kDim,kVocab,d.dense,d.dense_bytes,st);
     } else ops::bf16_linear_rows(d.xn, B, head, kDim, kVocab, d.logits, st);
     for (int i = 0; i < B; ++i) {   // draft i: the Markov bias of the token before it, then the greedy pick
         dsk::markov_bias(i == 0 ? d.prm : d.out + i - 1, d.m_embed, d.m_head, kVocab, d.logits + (size_t) i * kVocab,
@@ -481,6 +564,7 @@ void Engine::Impl::run_dspark_job(ExpertDoorbell* d, int m) {
 }
 
 Engine::Draft Engine::Impl::draft(int token) {
+    DeviceScope scope(stage.device);
     usable();
     if (!ds) throw std::logic_error("ds41 dspark: the engine was created without EngineOptions::dspark");
     if (verify_pending) throw std::logic_error("commit the pending verify window first");
@@ -490,6 +574,8 @@ Engine::Draft Engine::Impl::draft(int token) {
     Draft r;
     if (pos < 1 || pos + Dspark::B > max_seq) return r;   // no committed token yet, or no room for the drafts
     const double begin = now_ms();
+    d.cache_hits=0;
+    d.cache_hit_mask=0;
     int* p = d.prm_host;
     p[0] = token;
     for (int i = 1; i < Dspark::B; ++i) p[i] = dsk::kNoiseToken;
@@ -548,6 +634,7 @@ Engine::Draft Engine::Impl::draft(int token) {
         ck(cudaStreamSynchronize(st), "dspark draft");
     } catch (...) {
         job_cancel = true;
+        if(tensor) tensor->abort();
         job_end();
         if (d.db) d.db->mark_done(dsk::kStages);
         cudaStreamSynchronize(st);
@@ -582,6 +669,7 @@ Engine::Draft Engine::Impl::draft(int token) {
     }
     r.cpu_experts_ms = worker_us.load() / 1000.0;
     r.vram_hits = d.last_hits;
+    if(pack.has_exl3_dense()) r.vram_hits=d.cache_hits;
     r.uses = d.last_uses;
     r.ms = now_ms() - begin;
     return r;
@@ -622,6 +710,14 @@ Engine::Draft Engine::draft(int token) {
         if (split_verify_pending_) throw std::logic_error("commit the pending split verify window first");
         if (!tail_->ds) throw std::logic_error("DSpark was not enabled");
         try {
+            if(tensor_) {
+                Draft results[2];
+                tensor_both(tensor_,[&](int rank) { results[rank]=(rank?*tail_:*impl_).draft(token); });
+                if(results[0].tokens!=results[1].tokens) throw std::runtime_error("TP2 draft ranks disagree");
+                if(results[0].n)
+                    results[0].vram_hits=__builtin_popcountll(impl_->ds->cache_hit_mask & tail_->ds->cache_hit_mask);
+                return results[0];
+            }
             // Gather five embedding rows on their owning GPU. No duplicate
             // embedding arena and no peer dereference inside the draft kernels.
             for (int r = 0; r < dspark::kBlock; ++r) {

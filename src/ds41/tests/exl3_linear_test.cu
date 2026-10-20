@@ -91,6 +91,28 @@ void run(Verdict& verdict, int k, int n, int bits) {
     ck(cudaStreamSynchronize(stream), "dense logits"); const auto lg = logits.down();
     bool same = true; for (int i = 0; i < n; ++i) same &= lg[i] == __bfloat162float(got[i]);
     verdict.check(same, "EXL3 head returns BF16-rounded FP32");
+    for(int rows:{1,4,8}) {
+        const int xs=k+128,ys=n+128;
+        std::vector<__nv_bfloat16> inputs(size_t(rows)*xs);
+        for(int r=0;r<rows;++r) for(int i=0;i<k;++i)
+            inputs[size_t(r)*xs+i]=__float2bfloat16_rn(__bfloat162float(input[i])*(r%2?-.5f:1.f+float(r)/8));
+        Dev<__nv_bfloat16> sx(inputs),sy(size_t(rows)*ys);
+        Dev<__nv_bfloat16> sequential(size_t(rows)*ys);
+        Dev<float> sl(size_t(rows)*ys),sequential_logits(size_t(rows)*ys);
+        const auto bytes=exl3_small_rows_workspace_bytes(rows,k,n);Dev<uint8_t> small_ws(bytes);
+        for(int r=0;r<rows;++r) {
+            exl3_linear(sx.p+size_t(r)*xs,w,sequential.p+size_t(r)*ys,nullptr,ws.p,ws.n,stream);
+            exl3_linear(sx.p+size_t(r)*xs,w,nullptr,sequential_logits.p+size_t(r)*ys,ws.p,ws.n,stream);
+        }
+        exl3_linear_small_rows(sx.p,w,sy.p,nullptr,rows,xs,ys,small_ws.p,bytes,stream);
+        exl3_linear_small_rows(sx.p,w,nullptr,sl.p,rows,xs,ys,small_ws.p,bytes,stream);
+        ck(cudaStreamSynchronize(stream),"small dense rows");const auto ry=sy.down();const auto rl=sl.down();
+        const auto want=sequential.down();const auto want_logits=sequential_logits.down();
+        bool same=true;
+        for(int r=0;r<rows;++r) for(int j=0;j<n;++j)
+            same &= !std::memcmp(&ry[size_t(r)*ys+j],&want[size_t(r)*ys+j],2) && rl[size_t(r)*ys+j]==want_logits[size_t(r)*ys+j];
+        verdict.check(same,"small strided rows/head bit-identical to sequential GEMV");
+    }
     bool bad = false;
     try { exl3_linear(x.p, w, output.p, nullptr, ws.p, bytes - 1, stream); }
     catch (const std::invalid_argument&) { bad = true; }

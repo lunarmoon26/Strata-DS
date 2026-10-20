@@ -189,7 +189,7 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // This changes register allocation only; keep the prefetch/MMA/fold body intact.
 template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
 __device__ __forceinline__
-void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
+void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
 {
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
     const strata_exl3::GemvJob job = jobs[blockIdx.y];
@@ -197,7 +197,7 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
     const half* A = job.A;
     const uint16_t* B = job.B;
     void* C = job.C;
-    const int size_m = 1;
+    const int size_m = rows;
     const int size_k = job.k;
     const int size_n = job.n;
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2)

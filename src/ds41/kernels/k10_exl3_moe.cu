@@ -4,8 +4,33 @@
 // CMake intentionally builds only this translation unit.
 #include "../../../third_party/exllamav3_gpu/quant/exl3_gemv.cu"
 #include "k10/pipeline.cuh"
+#include "k10/tensor.cuh"
 
 namespace strata::ds41::kernels {
+
+void exl3_moe_tensor_up(const __half* x,int m,const int32_t* selected,const float* weights,int topk,
+                        const Exl3Expert* experts,void* workspace,size_t bytes,int rank,cudaStream_t stream) {
+    if(!x || !selected || !weights || !experts || !workspace || m<1 || m>8 || topk<1 || topk>6 ||
+       rank<0 || rank>1 || bytes<k10::Workspace::bytes(m*topk))
+        throw std::invalid_argument("TP2 expert up arguments");
+    const int slots=m*topk;const k10::Workspace ws(workspace,slots);
+    k10::tensor_input_had<<<dim3(2*slots,k10::H/128),32,0,stream>>>(x,selected,topk,experts,ws.input,ws.gu,ws.jobs);
+    strata_exl3::gemv_mul1(ws.jobs,2*slots,k10::F/2,stream);
+    k10::tensor_activate<<<dim3(slots,k10::F/256),32,0,stream>>>(selected,weights,experts,ws.gu,ws.down_input,ws.down,ws.jobs,rank);
+}
+void* exl3_moe_tensor_hidden(void* workspace,int m,int topk) {
+    if(!workspace || m<1 || m>8 || topk<1 || topk>6) throw std::invalid_argument("TP2 expert hidden arguments");
+    return k10::Workspace(workspace,m*topk).down_input;
+}
+void exl3_moe_tensor_down(int m,const int32_t* selected,int topk,const Exl3Expert* experts,
+                          float* output,void* workspace,size_t bytes,int rank,cudaStream_t stream) {
+    if(!selected || !experts || !output || !workspace || m<1 || m>8 || topk<1 || topk>6 ||
+       rank<0 || rank>1 || bytes<k10::Workspace::bytes(m*topk))
+        throw std::invalid_argument("TP2 expert down arguments");
+    const k10::Workspace ws(workspace,m*topk);
+    strata_exl3::gemv_mul1(ws.jobs,m*topk,k10::H/2,stream);
+    k10::tensor_output<<<dim3(m,k10::H/256),32,0,stream>>>(selected,topk,experts,ws.down,output,rank);
+}
 
 void exl3_moe_decode(const __half* x, int m, const int32_t* sel, const float* w, int topk,
                      const Exl3Expert* experts, float* out, void* workspace,

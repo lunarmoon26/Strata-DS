@@ -12,7 +12,7 @@
 namespace strata::ds41 {
 
 // File -> bounded pinned staging -> device, preserving every byte. No mmap or
-// weight-sized host allocation. Used only by the resident split path.
+// weight-sized host allocation. Used only by resident layer-split/TP2 paths.
 class BoundedUpload {
 public:
     static constexpr size_t kStagingBytes = 4ull << 20;
@@ -64,6 +64,31 @@ public:
                          "bounded upload");
             posix_fadvise(fd_, offset + done, n, POSIX_FADV_DONTNEED);
             done += n;
+        }
+    }
+    /// Read bounded groups of complete source rows, upload only the requested
+    /// columns. EXL3 trellis tiles and embedding channels stay byte-identical.
+    void copy_columns(void* destination, uint64_t offset, size_t rows,
+                      size_t row_bytes, size_t first, size_t width) {
+        if (!destination || !rows || !row_bytes || row_bytes > kStagingBytes ||
+            first > row_bytes || !width || width > row_bytes-first || rows > SIZE_MAX/row_bytes)
+            throw std::invalid_argument("ds41: invalid bounded column upload");
+        validate(offset, uint64_t(rows)*row_bytes);
+        const size_t batch = kStagingBytes / row_bytes;
+        for (size_t done=0; done<rows;) {
+            const size_t count=std::min(batch,rows-done), bytes=count*row_bytes;
+            size_t got=0;
+            while(got<bytes) {
+                const ssize_t n=pread(fd_,static_cast<char*>(host_)+got,bytes-got,offset+done*row_bytes+got);
+                if(n<0 && errno==EINTR) continue;
+                if(n<=0) throw std::runtime_error("ds41: short read during column upload");
+                got+=size_t(n);
+            }
+            device_check(cudaMemcpy2D(static_cast<char*>(destination)+done*width,width,
+                                      static_cast<char*>(host_)+first,row_bytes,width,count,cudaMemcpyHostToDevice),
+                         "bounded column upload");
+            posix_fadvise(fd_,offset+done*row_bytes,bytes,POSIX_FADV_DONTNEED);
+            done+=count;
         }
     }
 private:

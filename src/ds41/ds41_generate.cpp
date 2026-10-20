@@ -355,6 +355,16 @@ int main(int argc, char** argv) {
         else if (a == "--ram-budget-gib") opt.ram_budget_gib = std::stod(next());
         else if (a == "--prefill") batched = true;
         else if (a == "--split-layer") opt.split_layer = std::stoi(next());
+        else if (a == "--draft-cache-mib") {
+            const auto mib=std::stoi(next());
+            if(mib<0 || mib>8192) throw std::invalid_argument("--draft-cache-mib must be in 0..8192");
+            opt.draft_cache_bytes=size_t(mib)<<20;
+        }
+        else if (a == "--parallelism") {
+            const auto mode=next();
+            if(mode!="layer" && mode!="tensor") throw std::invalid_argument("--parallelism must be layer or tensor");
+            opt.tensor_parallel=mode=="tensor";
+        }
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--prefill-ring") opt.prefill_ring = std::stoi(next());
         else if (a == "--prefill-batch") opt.prefill_batch = std::stoi(next());

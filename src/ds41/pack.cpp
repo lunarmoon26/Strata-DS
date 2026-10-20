@@ -106,6 +106,23 @@ std::vector<ExpertSlot> read_expert_index(const std::string& path, int n_layers,
 
 }  // namespace
 
+namespace {
+bool tensor_replicated_projection(const std::string& name) {
+    return name.compare(0,7,"layers.")==0 &&
+        (name.find(".attn.wq_a")!=std::string::npos || name.find(".attn.wkv")!=std::string::npos ||
+         name.find(".ffn.shared_experts.")!=std::string::npos);
+}
+int tensor_group_owner(const std::string& name) {
+    const std::string key=".attn.wo_a.slice.";
+    const auto at=name.find(key);
+    if(name.compare(0,7,"layers.") || at==std::string::npos) return -1;
+    const auto first=at+key.size();
+    if(first>=name.size() || name[first]<'0' || name[first]>='0'+kOGroups ||
+       (first+1<name.size() && name[first+1]!='.')) fail("invalid tensor output group: "+name);
+    return (name[first]-'0')/(kOGroups/2);
+}
+}
+
 kernels::Exl3Proj Pack::exl3_projection(const std::string& name, int k, int n) const {
     const auto& t = dense(name + ".trellis");
     const auto& u = dense(name + ".suh");
@@ -123,8 +140,15 @@ kernels::Exl3Proj Pack::exl3_projection(const std::string& name, int k, int n) c
     uint32_t marker = 0;
     check_cuda(cudaMemcpy(&marker, m.device, 4, cudaMemcpyDeviceToHost), "dense codebook marker");
     if (marker != 0x83DCD12Du) fail("unsupported EXL3 dense codebook: " + name);
-    return {static_cast<const uint16_t*>(t.device), static_cast<const __half*>(u.device),
-            static_cast<const __half*>(v.device), k, n, int(t.shape[2]), 2};
+    kernels::Exl3Proj result{static_cast<const uint16_t*>(t.device), static_cast<const __half*>(u.device),
+                             static_cast<const __half*>(v.device), k, n, int(t.shape[2]), 2};
+    if (tensor_rank_>=0 && !tensor_replicated_projection(name) && tensor_group_owner(name)<0) {
+        if(n%256) fail("TP2 projection output must align to two Hadamard blocks: "+name);
+        const auto it=tensor_collectives_.emplace(name,int(tensor_collectives_.size())+1).first;
+        if(it->second>=700) fail("TP2 projection collective table overflow");
+        result.n=n/2; result.shard_rank=tensor_rank_; result.shard_count=2; result.collective_slot=it->second;
+    }
+    return result;
 }
 
 size_t dtype_size(DType t) {
@@ -364,6 +388,50 @@ uint64_t Pack::upload_dense(const StageRange& stage, bool draft) {
         t.device = static_cast<char*>(arena_) + offset;
         file.copy(t.device, t.file_offset, t.bytes);
         offset += (t.bytes + 255) / 256 * 256;
+    }
+    return total;
+}
+
+uint64_t Pack::upload_dense_tensor(int device,int rank,bool draft) {
+    if(arena_ || (rank!=0 && rank!=1) || !has_exl3_dense() || has_mcg())
+        fail("TP2 requires an unloaded full mul1 EXL3 pack and rank 0 or 1");
+    DeviceScope scope(device); arena_device_=device; tensor_rank_=rank;
+    BoundedUpload file(dir_+"/dense.bin");
+    struct Slice { size_t rows,row_bytes,first,width; bool selected; };
+    auto plan=[&](const std::string& name,const DenseTensor& t) -> Slice {
+        if(name.compare(0,4,"mtp.")==0 && !draft) return {0,0,0,0,false};
+        const int group_owner=tensor_group_owner(name);
+        if(group_owner>=0 && group_owner!=rank) return {0,0,0,0,false};
+        if(group_owner>=0 || tensor_replicated_projection(name)) return {1,size_t(t.bytes),0,size_t(t.bytes),true};
+        if(name.size()>=8 && name.compare(name.size()-8,8,".trellis")==0) {
+            if(t.shape.size()!=3 || t.shape[1]%16) fail("TP2 trellis is not Hadamard-aligned: "+name);
+            const size_t row=size_t(t.shape[1])*t.shape[2]*2;
+            return {size_t(t.shape[0]),row,size_t(rank)*row/2,row/2,true};
+        }
+        if(name.size()>=4 && name.compare(name.size()-4,4,".svh")==0) {
+            if(t.shape.size()!=1 || t.shape[0]%256) fail("TP2 scale vector is not Hadamard-aligned: "+name);
+            return {1,size_t(t.bytes),size_t(rank)*t.bytes/2,size_t(t.bytes/2),true};
+        }
+        if(name=="embed.weight") {
+            if(t.dtype!=DType::BF16 || t.shape!=std::vector<int64_t>{kVocab,kDim}) fail("TP2 embedding geometry");
+            return {kVocab,kDim*2,size_t(rank)*kDim,size_t(kDim),true};
+        }
+        return {1,size_t(t.bytes),0,size_t(t.bytes),true};
+    };
+    uint64_t total=0;
+    for(const auto& [name,t]:dense_) {
+        file.validate(t.file_offset,t.bytes);const auto s=plan(name,t);
+        if(s.selected) total+=(uint64_t(s.rows)*s.width+255)/256*256;
+    }
+    if(!total || total>SIZE_MAX) fail("TP2 dense arena is empty or overflowing");
+    check_cuda(cudaMalloc(&arena_,size_t(total)),"TP2 dense arena");
+    size_t offset=0;
+    for(auto& [name,t]:dense_) {
+        const auto s=plan(name,t);if(!s.selected) continue;
+        t.device=static_cast<char*>(arena_)+offset;
+        if(s.first || s.width!=s.row_bytes) file.copy_columns(t.device,t.file_offset,s.rows,s.row_bytes,s.first,s.width);
+        else file.copy(t.device,t.file_offset,t.bytes);
+        offset+=(s.rows*s.width+255)/256*256;
     }
     return total;
 }
