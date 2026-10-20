@@ -67,7 +67,9 @@ int main() {
         require(pack.has_mcg(), "MCG tags not parsed");
         bool refused = false;
         try { Engine engine(fixture.dir, EngineOptions{}); }
-        catch (const std::invalid_argument& error) { refused = std::string(error.what()).find("MCG K2 currently requires") != std::string::npos; }
+        // The resident-only port rejects every single-device construction before
+        // opening a pack, so its device-policy guard precedes the MCG guard.
+        catch (const std::invalid_argument& error) { refused = std::string(error.what()).find("requires --devices") != std::string::npos; }
         require(refused, "MCG entered the single-device CPU fallback path");
         VramExperts::Adapt adapt; adapt.every = 0;
         {

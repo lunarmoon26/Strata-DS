@@ -1,8 +1,10 @@
 # DeepSeek 1017 resident profile (experimental)
 
-**Status:** upstream-based source port, not the deployed engine. The base is
+**Status:** upstream-based source port, deployed locally with partial GPU
+qualification. The base is
 `Niko1221/Strata@e88ee39d1d6be6e3364183af3b39b62a7ed6f211`.
-Local installer edits, model packs and the running server remain unchanged.
+Deployment wrappers pin the engine separately. Generated settings and model
+packs stay local.
 Backups stay local; the public repository contains only the `main` branch.
 
 ## Scope and source ownership
@@ -70,16 +72,15 @@ these GPUs. Starting the generated launcher is a separate, manual operation.
 
 The source port is checked with a source/build dependency audit, offline installer
 tests, DeepSeek tokenizer/parser/API tests and selected regressions of touched
-upstream interfaces. The CUDA binaries compile without loading weights. GPU component
-tests and a new full-model cold start/long-context run are separate qualification
-gates; they are not run alongside the existing model server.
+upstream interfaces. Compilation does not load weights. GPU and real-model tests
+run separately from the model server, never as competing model-sized processes.
 
 Historical measurements in the old fork qualify that old binary only. They are
-not performance or full-model correctness evidence for this port. Publication of
-the source is not deployment approval; real-model qualification and a reviewed
-deployment pin are still required before replacing the existing service.
+not performance or full-model correctness evidence for this port. The local
+deployment uses a reviewed source pin; passing startup and short-input checks
+does not qualify the full context or every API path.
 
-### Validation of this port — 2026-10-20
+### Initial source-port checks — 2026-10-20
 
 - CUDA 13.4 / GCC 15 / SM120 build: `ds41_serve`, `ds41_generate`, component
   binaries and the opt-in model-test binaries compile. This does not load weights.
@@ -98,6 +99,22 @@ deployment pin are still required before replacing the existing service.
   corrected to the documented native protocol and the final run passes. Private
   failed/follow-up receipts remain outside this repository.
 
-Still unverified: real-model startup/API behavior, 524K input, new-binary
-numerics, performance, GPU component execution, and container GPU runtime. No
-full upstream-suite or cross-backend build coverage is claimed.
+### Local GPU qualification — 2026-10-20
+
+- All 11 component CTests pass, including GPU transfer/upload, MCG decoding/pack
+  checks, EXL3 linear operations, staged experts and bounded prefill experts.
+  The initial MCG pack test expected the old MCG-specific refusal message; its
+  assertion now checks the resident device-policy guard, which rejects earlier.
+  Production engine behavior is unchanged.
+- A 513-token real-model retrieval case generates `BRONZE-73921` and passes
+  batched/sequential predictive agreement, snapshot restore, deterministic replay
+  and cancellation recovery. Final prefill logits are byte-identical to the
+  historical binary on that fixture. This is not an independent model reference.
+- The native deployment builds from this source and starts loaded/healthy with
+  524288 configured capacity. The actual 524256-token rerun and queued follow-up
+  checks were cancelled at the user's request, not counted as passes.
+
+Still unverified: complete actual 524K input, fresh real-model API qualification,
+broad numerics/quality/performance, and container GPU runtime. No full
+upstream-suite or cross-backend build coverage is claimed. Private failed and
+cancelled receipts remain local.
