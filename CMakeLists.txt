@@ -56,6 +56,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+option(STRATA_ENABLE_DS41 "Opt-in DeepSeek 1017 resident two-GPU backend" OFF)
+option(STRATA_DS41_STANDALONE "Build only the resident backend, not upstream Qwen targets" OFF)
 # AMD gfx906 (MI50, wave64): the same .cu sources compiled as HIP through the gfx906 compat layer.  The CUDA runtime and
 # cuBLAS names are mapped by the headers in include/strata/platform/hip_compat/, which go first on the include path,
 # and CUDA::cudart / CUDA::cublas become aliases of HIP's targets, so every CUDA target below stays as it is.  This is
@@ -214,6 +216,15 @@ elseif(STRATA_ENABLE_HIP)
   set(_strata_gpu_runtime_target strata_hip_runtime)
   set(_strata_gpu_blas_target ${STRATA_HIP_BLAS_TARGETS})
   set(_strata_gpu_include_directories ${STRATA_HIP_COMPAT_INCLUDE_DIR})
+endif()
+
+if(STRATA_ENABLE_DS41)
+  include(cmake/ds41_resident.cmake)
+  if(STRATA_DS41_STANDALONE)
+    return()
+  endif()
+elseif(STRATA_DS41_STANDALONE)
+  message(FATAL_ERROR "STRATA_DS41_STANDALONE requires STRATA_ENABLE_DS41")
 endif()
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied

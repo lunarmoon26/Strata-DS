@@ -518,10 +518,12 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
+        if deepseek and _has_image(m.get("content")):
+            raise ValueError("DeepSeek V4.1 does not support images in this server")
         role = m.get("role")
         if role == "developer":
             role = "system"
@@ -539,7 +541,11 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
                 calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
+                if deepseek and c.get("id"):
+                    calls[-1]["id"] = c["id"]
             out["tool_calls"] = calls
+        if deepseek and m.get("tool_call_id"):
+            out["tool_call_id"] = m["tool_call_id"]
         messages.append(out)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
@@ -555,7 +561,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
+    return (messages if deepseek else _env_to_user(_late_system_to_user(messages))), tools, kwargs
 
 
 BILLING_HEADER = "x-anthropic-billing-header:"
@@ -587,17 +593,22 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
     renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
     messages = []
     system = req.get("system")
+    if deepseek and _has_image(system):
+        raise ValueError("DeepSeek V4.1 does not support images in this server")
     if system:
         messages.append({"role": "system",
                          "content": pin_billing_stamp(_text_of(_check_parts(system, "system", TEXT_PARTS)))})
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
         content = _check_parts(m.get("content"), f"messages[{i}].content", ANTHROPIC_BLOCKS)
+        if deepseek and (_has_image(content) or isinstance(content, list) and any(
+                b.get("type") == "tool_result" and _has_image(b.get("content")) for b in content)):
+            raise ValueError("DeepSeek V4.1 does not support images in this server")
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
@@ -617,11 +628,15 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                if deepseek and block.get("id"):
+                    calls[-1]["id"] = block["id"]
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
                     block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+                if deepseek and block.get("tool_use_id"):
+                    messages[-1]["tool_call_id"] = block["tool_use_id"]
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -656,7 +671,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
+    return (messages if deepseek else _env_to_user(_late_system_to_user(messages))), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser
@@ -758,7 +773,7 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+def forced_call(tool_choice, tools: list[dict] | None, deepseek: bool = False) -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
     "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
@@ -767,6 +782,9 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
     if kind in ("auto", "none"):
+        return None
+    if deepseek:
+        print("[strata] forced tool openings use Qwen XML, not DeepSeek DSML; the model decides", flush=True)
         return None
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
         kind, name = "named", next(iter(names))

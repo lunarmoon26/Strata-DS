@@ -1,5 +1,11 @@
 # Installing Strata for a user (instructions for AI agents)
 
+For this fork's optional resident DeepSeek 1017 candidate, use
+[DEEPSEEK_1017.md](DEEPSEEK_1017.md). The explicit configure-only profile uses
+pre-provisioned assets and never downloads, builds, quantizes or starts a model.
+The upstream Terminal/default-model setup instructions below are unchanged and
+do not install that profile.
+
 This page is written for an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...) that a user asked to
 set up Strata on their PC. Strata runs the Qwen3.8-Flash-Next model locally on one NVIDIA or AMD graphics card plus
 system RAM (or on an Apple Silicon Mac), and serves an OpenAI- and Anthropic-compatible API on `http://127.0.0.1:8080`.

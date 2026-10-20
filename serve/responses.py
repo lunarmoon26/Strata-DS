@@ -125,7 +125,7 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
-def input_messages(req: dict) -> list[dict]:
+def input_messages(req: dict, deepseek: bool = False) -> list[dict]:
     """`instructions` + `input` -> the chat template's messages."""
     messages = []
     instructions = req.get("instructions")
@@ -207,7 +207,7 @@ def input_messages(req: dict) -> list[dict]:
         lead += 1
     if lead > 1:
         messages[:lead] = [{"role": "system", "content": "\n\n".join(m["content"] for m in messages[:lead])}]
-    return _late_system_to_user(messages)
+    return messages if deepseek else _late_system_to_user(messages)
 
 
 def _order_tool_results(messages):

@@ -1,0 +1,1130 @@
+--- a/third_party/exllamav3_gpu/quant/exl3_gemv.cu
++++ b/third_party/exllamav3_gpu/quant/exl3_gemv.cu
+@@ -1 +1 @@
+-#include <cuda_fp16.h>
++// Strata raw-pointer adapter for the upstream small-row GEMV kernel.
+@@ -3,5 +3 @@
+-
+-#include <c10/cuda/CUDAGuard.h>
+-#include <ATen/cuda/CUDAContext.h>
+-#include <cooperative_groups.h>
+-namespace cg = cooperative_groups;
++#include <cassert>
+@@ -11,2 +6,0 @@
+-#include "exl3_devctx.cuh"
+-#include <map>
+@@ -14,4 +8 @@
+-/*
+-QTIP-style small-m GEMV path, kernel in exl3_gemv_kernel.cuh. Dispatched from exl3_gemm via
+-exl3_gemv_try_launch when the shape heuristic applies, or forced through the exl3_gemv entry
+-point. Kernel arguments and graph parameter offsets are identical to exl3_gemm_kernel.
++namespace strata_exl3 {
+@@ -19,11 +10,4 @@
+-Env: EXL3_GEMV = 0 disables the path, 1/unset = heuristic (default), 2 = use wherever the hard
+-constraints allow (testing).
+-
+-Heuristic envelope (measured, RTX 3090, 4 bpw, m <= 8, vs the tuned regular kernel): the narrow
+-config wins 15-60% at attention-projection sizes (n <= 4096), the wide config wins ~8% at
+-large-n/small-k FFN sizes. Big-k x big-n shapes lose slightly and fall through to the regular
+-kernel, as do other architectures (Ada/Blackwell are memory-bound here and keep the regular
+-kernel), bpw != 4, and m > 8.
+-*/
+-
+-static int exl3_gemv_env_mode()
++// Each block reads one job. The branch is uniform before any barrier.
++// Retain K10's two-CTA bound for the inlined K3 body.
++__global__ __launch_bounds__(512, 2)
++void gemv_mul1_jobs(const GemvJob* jobs)
+@@ -31,3 +15,18 @@
+-    const char* env = std::getenv("EXL3_GEMV");
+-    if (!env) return 1;
+-    return atoi(env);
++    const GemvJob job = jobs[blockIdx.y];
++    if (!job.B) return;
++    if (job.codebook == 1) {
++        if (job.bits == 2) exl3_gemv_kernel<2, true, 1, 0, 0, false>(jobs);
++        else assert(false && "MCG adapter supports K2 only");
++        return;
++    }
++    assert(job.codebook == 2 && "unknown EXL3 codebook");
++    switch (job.bits)
++    {
++        case 3: exl3_gemv_kernel<3, true, 2, 0, 0, false>(jobs); break;
++        case 1: exl3_gemv_kernel<1, true, 2, 0, 0, false>(jobs); break;
++        case 2: exl3_gemv_kernel<2, true, 2, 0, 0, false>(jobs); break;
++        case 4: exl3_gemv_kernel<4, true, 2, 0, 0, false>(jobs); break;
++        case 5: exl3_gemv_kernel<5, true, 2, 0, 0, false>(jobs); break;
++        case 6: exl3_gemv_kernel<6, true, 2, 0, 0, false>(jobs); break;
++        default: assert(false && "K10: expected integer K1..K6");
++    }
+@@ -36,2 +35 @@
+-// -1 = default per bits, 0 = force shuffle extraction, 1 = force smem staging (testing)
+-static int exl3_gemv_env_smem()
++void gemv_mul1(const GemvJob* jobs, int count, int max_n, cudaStream_t stream)
+@@ -39,3 +37 @@
+-    const char* env = std::getenv("EXL3_GEMV_SMEM");
+-    if (!env) return -1;
+-    return atoi(env);
++    gemv_mul1_jobs<<<dim3(max_n / 32, count), 512, 0, stream>>>(jobs);
+@@ -44,216 +40 @@
+-// -1: not eligible, 0: narrow config, 1: wide config. narrow_coresident = number of narrow-config
+-// blocks that fit on the device at once (its grid is one block per 32 output columns)
+-static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int cb, int mode, int narrow_coresident)
+-{
+-    if (mode == 0) return -1;
+-    if (K < 2 || K > 4) return -1;
+-    if (K != 4 && cb == 0) return -1;
+-    if (size_m > EXL3_GEMV_MAX_M) return -1;
+-    if (size_k % 128 || size_n % 128) return -1;
+-    //if (cc != CC_AMPERE) return -1;  // measured win on Ampere; Ada/Blackwell are memory-bound here
+-    if (mode == 2) return size_n <= 8192 ? 0 : 1;
+-    if (mode == 3) return 0;   // testing: force narrow config
+-    if (mode == 4) return 1;   // testing: force wide config
+-
+-    // The narrow config wins (up to ~30%) whenever its grid fits in a single co-resident wave;
+-    // in the 1..2-wave zone the trailing partial wave costs more than the kernel gains unless
+-    // per-group work is small (small k). The wide config covers a band of large-n shapes with
+-    // small-to-mid k. Everything else runs the regular block-pipelined kernel.
+-    // Per-bits envelopes: 2 bpw is decode-bound and won at every measured shape on both archs;
+-    // 3 bpw wins everywhere on Ada but only in the narrow envelope on Ampere
+-    if (K == 2) return size_n <= 8192 ? 0 : 1;
+-    if (K == 3 && cc == CC_ADA) return size_n <= 8192 ? 0 : 1;
+-    if (size_n / 32 <= narrow_coresident) return 0;
+-    if (size_k <= 2048 && size_n <= 8192) return 0;
+-    if (K == 3) return -1;
+-    if (size_n >= 8192 && size_k <= 4096) return 1;
+-    if (size_n >= 8192 && size_n <= 10240 && size_k <= 5120 && cc == CC_AMPERE) return 1;
+-    return -1;
+-}
+-
+-static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem)
+-{
+-    #define SEL(bits_, cb_, fp32_, mm_, cfg_, sm_) \
+-        if (bits == bits_ && cb == cb_ && c_fp32 == fp32_ && mmode == mm_ && cfg == cfg_ && smem == sm_) \
+-            return (void*) exl3_gemv_kernel<bits_, fp32_, cb_, mm_, cfg_, sm_>;
+-    #define SEL_GRID(bits_, cb_, sm_) \
+-        SEL(bits_, cb_, false, 0, 0, sm_) SEL(bits_, cb_, false, 0, 1, sm_) \
+-        SEL(bits_, cb_, false, 1, 0, sm_) SEL(bits_, cb_, false, 1, 1, sm_) \
+-        SEL(bits_, cb_, true,  0, 0, sm_) SEL(bits_, cb_, true,  0, 1, sm_) \
+-        SEL(bits_, cb_, true,  1, 0, sm_) SEL(bits_, cb_, true,  1, 1, sm_)
+-    SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
+-    SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
+-    SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+-    #undef SEL_GRID
+-    #undef SEL
+-    return nullptr;
+-}
+-
+-bool exl3_gemv_try_launch
+-(
+-    void** kernel_args,
+-    int size_m,
+-    int size_k,
+-    int size_n,
+-    int K,
+-    bool half_k,
+-    int cb,
+-    bool c_fp32,
+-    bool has_su_sv,
+-    int device,
+-    cudaStream_t stream,
+-    void** launched_kernel,
+-    bool force
+-)
+-{
+-    // Free integer checks first; the env read (~64 ns) and device queries only run for calls
+-    // that could actually take this path
+-    if (!has_su_sv) return false;
+-    if (half_k)
+-    {
+-        if (K < 1 || K > 3 || cb != 2) return false;
+-    }
+-    else
+-    {
+-        if (K < 2 || K > 4) return false;
+-        if (K != 4 && cb == 0) return false;
+-    }
+-    if (size_m > EXL3_GEMV_MAX_M) return false;
+-    if (size_k % 128 || size_n % 128) return false;
+-
+-    int mode = force ? 2 : exl3_gemv_env_mode();
+-    if (mode == 0) return false;
+-    int cc = DevCtx::instance().get_cc(device);
+-    // if (cc != CC_AMPERE) return false;
+-    int mmode = size_m == 1 ? 0 : 1;
+-    int num_sms = DevCtx::instance().get_num_sms(device);
+-
+-    // Cooperative launch: grids are capped at full co-residency (cached per kernel), and the
+-    // narrow config's co-residency also feeds the shape heuristic
+-    static std::map<void*, int> occ_cache[MAX_DEVICES];
+-    auto& cache = occ_cache[device];
+-    auto occupancy = [&] (void* kernel, int block_dim) -> int
+-    {
+-        auto it = cache.find(kernel);
+-        if (it != cache.end()) return it->second;
+-        int blocks_per_sm;
+-        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0));
+-        cache[kernel] = blocks_per_sm;
+-        return blocks_per_sm;
+-    };
+-
+-    // Extraction style: shuffle by default, smem staging selectable per call for evaluation
+-    bool smem = exl3_gemv_env_smem() == 1;
+-
+-    auto select = [&] (int cfg_) -> void*
+-    {
+-        return half_k ? exl3_gemv_select_kernel_half(K, c_fp32, mmode, cfg_, smem)
+-                      : exl3_gemv_select_kernel(K, cb, c_fp32, mmode, cfg_, smem);
+-    };
+-    void* narrow_kernel = select(0);
+-    if (!narrow_kernel) return false;
+-    int narrow_coresident = occupancy(narrow_kernel, 512) * num_sms;
+-
+-    // Shape heuristic: a half-integer rate K + 0.5 is handled like the integer rate above it (its tile is
+-    // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
+-    int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
+-    if (cfg < 0) return false;
+-
+-    void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
+-    if (!kernel) return false;
+-
+-    int block_dim = cfg == 0 ? 512 : 256;
+-    int cols = cfg == 0 ? 32 : 64;
+-
+-    int max_blocks = occupancy(kernel, block_dim) * num_sms;
+-    int grid = MIN(size_n / cols, max_blocks);
+-    if (grid < 1) return false;
+-
+-    cuda_check(cudaLaunchCooperativeKernel
+-    (
+-        kernel,
+-        dim3(grid),
+-        dim3(block_dim),
+-        kernel_args,
+-        0,
+-        stream
+-    ));
+-
+-    if (launched_kernel) *launched_kernel = kernel;
+-    return true;
+-}
+-
+-void exl3_gemv
+-(
+-    const at::Tensor& A,
+-    const at::Tensor& B,
+-    at::Tensor& C,
+-    const c10::optional<at::Tensor>& suh,
+-    const c10::optional<at::Tensor>& A_had,
+-    const c10::optional<at::Tensor>& svh,
+-    bool mcg,
+-    bool mul1
+-)
+-{
+-    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+-
+-    TORCH_CHECK_DIM(B, 3);
+-    TORCH_CHECK_SHAPES(A, -1, B, 0, 16);
+-    TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+-    TORCH_CHECK_DTYPE(A, kHalf);
+-    TORCH_CHECK_DTYPE(B, kShort);
+-    bool c_fp32 = C.dtype() == at::kFloat;
+-    if (!c_fp32) TORCH_CHECK_DTYPE(C, kHalf);
+-    TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1")
+-
+-    const half* suh_ptr = (const half*) OPTPTR(suh);
+-    half* A_had_ptr = (half*) OPTPTR(A_had);
+-    const half* svh_ptr = (const half*) OPTPTR(svh);
+-    TORCH_CHECK(suh_ptr && A_had_ptr && svh_ptr, "exl3_gemv requires suh, A_had and svh");
+-
+-    int size_m = 1;
+-    int dim = A.dim();
+-    for (int d = 0; d < dim - 1; ++d) size_m *= A.size(d);
+-    int size_k = A.size(-1);
+-    int size_n = B.size(1) * 16;
+-    const int tile_u16 = B.size(2);
+-    const bool half_k = (tile_u16 % 16) != 0;
+-    int K = tile_u16 / 16;
+-    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemv: half-integer bitrates require the mul1 codebook");
+-
+-    int cb = 0;
+-    if (mcg) cb = 1;
+-    if (mul1) cb = 2;
+-
+-    int device;
+-    cudaGetDevice(&device);
+-    int* locks = DevCtx::instance().get_locks(device);
+-
+-    const half* A_ptr = (const half*) A.data_ptr();
+-    const uint16_t* B_ptr = (const uint16_t*) B.data_ptr();
+-    void* C_ptr = (void*) C.data_ptr();
+-
+-    void* kernel_args[] =
+-    {
+-        (void*)& A_ptr,
+-        (void*)& B_ptr,
+-        (void*)& C_ptr,
+-        (void*)& size_m,
+-        (void*)& size_k,
+-        (void*)& size_n,
+-        (void*)& locks,
+-        (void*)& suh_ptr,
+-        (void*)& A_had_ptr,
+-        (void*)& svh_ptr
+-    };
+-
+-    bool ok = exl3_gemv_try_launch
+-    (
+-        kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+-        true, device, stream, nullptr, true
+-    );
+-    TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");
+-
+-    cuda_check(cudaPeekAtLastError());
+-}
++}  // namespace strata_exl3
+--- a/third_party/exllamav3_gpu/quant/exl3_gemv.cuh
++++ b/third_party/exllamav3_gpu/quant/exl3_gemv.cuh
+@@ -3 +3 @@
+-#include <ATen/Tensor.h>
++#include <cuda_fp16.h>
+@@ -4,0 +5 @@
++#include <cstdint>
+@@ -6,3 +7 @@
+-// QTIP-style small-m GEMV path (see exl3_gemv_kernel.cuh). Launched from exl3_gemm when the
+-// heuristic applies; also exposed directly for testing. Same kernel arguments as
+-// exl3_gemm_kernel, so graph recording/patching is identical.
++namespace strata_exl3 {
+@@ -10,19 +9,11 @@
+-// Try to dispatch a GEMM call to the GEMV kernel. Returns false (launching nothing) if the
+-// call is not eligible. On success *launched_kernel receives the kernel pointer for graph
+-// recording. `force` bypasses the shape heuristic but not the hard constraints.
+-bool exl3_gemv_try_launch
+-(
+-    void** kernel_args,
+-    int size_m,
+-    int size_k,
+-    int size_n,
+-    int K,
+-    bool half_k,
+-    int cb,
+-    bool c_fp32,
+-    bool has_su_sv,
+-    int device,
+-    cudaStream_t stream,
+-    void** launched_kernel,
+-    bool force
+-);
++// One row, already input-Hadamard transformed. C is FP32 before output Hadamard.
++// Stored on device; B == nullptr skips a slot without touching A or C.
++struct GemvJob {
++    const half* A;
++    const uint16_t* B;
++    float* C;
++    int k;
++    int n;
++    int bits;
++    int codebook = 2;
++};
+@@ -30,2 +21,3 @@
+-// Kernel instances for the half-integer bitrates (comp_units/exl3_gemv_half_inst.cu)
+-void* exl3_gemv_select_kernel_half(int bits, bool c_fp32, int mmode, int cfg, bool smem);
++// K10: integer K1..K6 mul1 or K2 MCG; one row per job. max_n sizes grid.x;
++// each job's n must be a multiple of 128 and no larger than max_n.
++void gemv_mul1(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
+@@ -33,12 +25 @@
+-// Direct entry point (testing): errors if the call is not hard-eligible
+-void exl3_gemv
+-(
+-    const at::Tensor& A,
+-    const at::Tensor& B,
+-    at::Tensor& C,
+-    const c10::optional<at::Tensor>& suh,
+-    const c10::optional<at::Tensor>& A_had,
+-    const c10::optional<at::Tensor>& svh,
+-    bool mcg,
+-    bool mul1
+-);
++}  // namespace strata_exl3
+--- a/third_party/exllamav3_gpu/quant/exl3_gemv_kernel.cuh
++++ b/third_party/exllamav3_gpu/quant/exl3_gemv_kernel.cuh
+@@ -7,2 +7,2 @@
+-//   B streams straight to registers with ld.global.cs (evict-first; B is single-use) behind a
+-//   register prefetch ring
++//   B streams straight to registers behind the original register prefetch ring; narrow
++//   integer loads use ld.global.cg (L2-only), other configurations retain ld.global.cs
+@@ -16,3 +16,2 @@
+-// Same launch signature as exl3_gemm_kernel so kernel args and graph parameter patching are
+-// interchangeable. Cooperative launch: one grid.sync after the input Hadamard stage and one before
+-// the output stage, no other cross-block coordination. 2, 3 and 4 bpw.
++// Strata adaptation: one device job per grid.y entry. Input/output Hadamards run in
++// surrounding launches; the main GEMV arithmetic below is unchanged. No cooperative launch.
+@@ -24 +23 @@
+-#include <cooperative_groups.h>
++#include "exl3_gemv.cuh"
+@@ -185,0 +185,5 @@
++// Strata K10: the raw-job integer instance reaches 79 registers on CUDA 12.8
++// sm_89 without the two-block bound, leaving only 16 resident warps. Apply the
++// same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
++// allowing 32 resident warps to cover the streaming trellis-load latency.
++// This changes register allocation only; keep the prefetch/MMA/fold body intact.
+@@ -187,5 +191,15 @@
+-__global__ __launch_bounds__(CFG == 0 ? 512 : 256, HALF && CFG == 0 ? 2 : 1)
+-void exl3_gemv_kernel(EXL3_GEMM_ARGS)
+-{
+-    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2) : (bits == 2 || bits == 3 || bits == 4),
+-                  "exl3_gemv_kernel supports 2, 3 and 4 bpw, and 1.5, 2.5 and 3.5 bpw with mul1");
++__device__ __forceinline__
++void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs)
++{
++    // A is already in the Hadamard basis. A null trellis marks an empty slot.
++    const strata_exl3::GemvJob job = jobs[blockIdx.y];
++    if (!job.B) return;  // uniform for the whole block, before any barrier
++    const half* A = job.A;
++    const uint16_t* B = job.B;
++    void* C = job.C;
++    const int size_m = 1;
++    const int size_k = job.k;
++    const int size_n = job.n;
++    static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2)
++                       : ((bits >= 1 && bits <= 6 && cb == 2) || (bits == 2 && cb == 1)),
++                  "Strata GEMV supports mul1 K1..K6 or MCG K2");
+@@ -194,2 +208,3 @@
+-    constexpr int PF   = CFG == 0 ? 4 : 2;      // prefetch ring depth
+-    constexpr int FOLD = CFG == 0 ? 4 : 2;      // fp16->fp32 fold cadence (divides PF)
++    constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
++    constexpr int FOLD = CFG == 0 ? 4 : 2;      // upstream fp16->fp32 fold cadence
++    static_assert(FOLD % PF == 0, "prefetch ring must divide the arithmetic unroll");
+@@ -202,2 +217,7 @@
+-    constexpr int LOADS = TWO_PER_LOAD ? WNT / 2 : WNT;                       // warp loads per k-slice
+-    constexpr int LSTRIDE = TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
++    // Strata: keep K2/K3/K4's register decoder and load schedule unchanged.
++    // Other integer rates use the upstream shared-memory dq_dispatch template.
++    constexpr bool GENERIC = !HALF && (bits == 1 || bits > 4);
++    constexpr int TILE_LOADS = (TWORDS + 31) / 32;
++    constexpr int STAGE_STRIDE = GENERIC ? TILE_LOADS * 32 : TWORDS;
++    constexpr int LOADS = GENERIC ? WNT * TILE_LOADS : (TWO_PER_LOAD ? WNT / 2 : WNT);                       // warp loads per k-slice
++    constexpr int LSTRIDE = GENERIC ? 32 : TWO_PER_LOAD ? 2 * TWORDS : (TWORDS < 32 ? TWORDS : 32);   // uint32 per load (lanes < LSTRIDE load)
+@@ -205,21 +224,0 @@
+-
+-    auto grid = cooperative_groups::this_grid();
+-
+-    // Input scales and Hadamard transform, same as exl3_gemm_kernel
+-    {
+-        int total_warps = size_m * size_k / 128;
+-        int warps_grid = gridDim.x * blockDim.x / 32;
+-        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+-
+-        for(; this_warp < total_warps; this_warp += warps_grid)
+-            had_hf_r_128_inner<true, false>
+-            (
+-                A + this_warp * 128,
+-                A_had + this_warp * 128,
+-                suh + (this_warp * 128) % size_k,
+-                0.088388347648f  // 1/sqrt(128)
+-            );
+-
+-        grid.sync();
+-        A = A_had;
+-    }
+@@ -284 +283 @@
+-    [[maybe_unused]] __shared__ uint32_t sh_stage[SMEM_STAGE ? WK : 1][SMEM_STAGE ? LOADS * LSTRIDE : 1];
++    [[maybe_unused]] __shared__ uint32_t sh_stage[(SMEM_STAGE || GENERIC) ? WK : 1][(SMEM_STAGE || GENERIC) ? LOADS * LSTRIDE : 1];
+@@ -293,2 +292,16 @@
+-            if constexpr (LSTRIDE < 32)
+-                return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
++            // Keep the same scalar uint32 load, alignment, lane guard and address.
++            // Narrow integer weights stream through L2 without filling L1; other
++            // configurations retain the upstream streaming/evict-first policy.
++            if constexpr (GENERIC)
++            {
++                const int tile = l / TILE_LOADS;
++                const int word = (l % TILE_LOADS) * 32 + lane;
++                return word < TWORDS ? __ldcg(bp + (size_t) i * slice_stride + tile * TWORDS + word - lane) : 0;
++            }
++            else if constexpr (CFG == 0 && !HALF)
++            {
++                if constexpr (LSTRIDE < 32)
++                    return lane < LSTRIDE ? __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
++                else
++                    return __ldcg(bp + (size_t) i * slice_stride + l * LSTRIDE);
++            }
+@@ -296 +309,6 @@
+-                return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
++            {
++                if constexpr (LSTRIDE < 32)
++                    return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
++                else
++                    return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
++            }
+@@ -310 +328,3 @@
+-        for (int ib = 0; ib < myn; ib += PF)
++        // Keep the upstream arithmetic unroll/fold boundaries. Ring slots repeat
++        // within each fold group and are refilled before their next use.
++        for (int ib = 0; ib < myn; ib += FOLD)
+@@ -313 +333 @@
+-        for (int d = 0; d < PF; ++d)
++        for (int d = 0; d < FOLD; ++d)
+@@ -321 +341 @@
+-                bw[l] = pf[d][l];
++                bw[l] = pf[d % PF][l];
+@@ -327,4 +347,4 @@
+-                    pf[d][l] = ld_b(i + PF, l);
+-            }
+-
+-            if constexpr (SMEM_STAGE)
++                    pf[d % PF][l] = ld_b(i + PF, l);
++            }
++
++            if constexpr (SMEM_STAGE || GENERIC)
+@@ -352 +372 @@
+-                if constexpr (SMEM_STAGE)
++                if constexpr (SMEM_STAGE || GENERIC)
+@@ -354,2 +374,4 @@
+-                    const uint32_t* tp = &sh_stage[warp][t * TWORDS];
+-                    if constexpr (HALF)
++                    const uint32_t* tp = &sh_stage[warp][t * STAGE_STRIDE];
++                    if constexpr (GENERIC)
++                        dq_dispatch<bits, cb, false>(tp, lane << 3, f0, f1);
++                    else if constexpr (HALF)
+@@ -454,29 +476,2 @@
+-    // Output scales and Hadamard transform, same semantics as the inner GEMM epilogue
+-    {
+-        grid.sync();
+-
+-        int total_warps = size_m * size_n / 128;
+-        int warps_grid = gridDim.x * blockDim.x / 32;
+-        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+-
+-        for(; this_warp < total_warps; this_warp += warps_grid)
+-        {
+-            if constexpr (c_fp32)
+-                had_ff_r_128_inner<false, true>
+-                (
+-                    ((const float*) C) + this_warp * 128,
+-                    ((float*) C) + this_warp * 128,
+-                    svh + (this_warp * 128) % size_n,
+-                    0.088388347648f  // 1/sqrt(128)
+-                );
+-            else
+-                had_hf_r_128_inner<false, true>
+-                (
+-                    ((const half*) C) + this_warp * 128,
+-                    ((half*) C) + this_warp * 128,
+-                    svh + (this_warp * 128) % size_n,
+-                    0.088388347648f  // 1/sqrt(128)
+-                );
+-        }
+-    }
+-}
++    // Output Hadamard and svh scaling are performed by the caller.
++}
+--- a/third_party/exllamav3_gpu/quant/reconstruct.cu
++++ b/third_party/exllamav3_gpu/quant/reconstruct.cu
+@@ -1 +1 @@
+-#include <cuda_fp16.h>
++// Strata K12: raw-pointer dispatch for upstream trellis-only reconstruction.
+@@ -3,3 +3 @@
+-#include <c10/cuda/CUDAGuard.h>
+-#include <ATen/cuda/CUDAContext.h>
+-#include "../util.h"
++#include <cassert>
+@@ -9,2 +6,0 @@
+-#include "bits_k.cuh"
+-#include "hadamard_inner.cuh"
+@@ -116,10 +112 @@
+-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+-#define __(i, cb) reconstruct_batch_kernel<i, cb>
+-constexpr auto reconstruct_batch_kernel_instances = std::array
+-{
+-    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+-    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+-    reconstruct_batch_kernel<1, 2, true>, reconstruct_batch_kernel<2, 2, true>, reconstruct_batch_kernel<3, 2, true>
+-};
+-#undef __
++namespace strata_exl3 {
+@@ -127,233 +114,12 @@
+-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+-#define __(i, cb) reconstruct_kernel<i, cb>
+-constexpr auto reconstruct_kernel_instances = std::array
+-{
+-    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+-    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+-    reconstruct_kernel<1, 2, true>, reconstruct_kernel<2, 2, true>, reconstruct_kernel<3, 2, true>
+-};
+-#undef __
+-
+-/*
+-Reconstruct encoded+packed tensor
+-*/
+-void reconstruct_slice
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed,
+-    float K_,
+-    bool mcg,
+-    bool mul1,
+-    int64_t n_offset
+-)
+-{
+-    const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
+-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+-
+-    // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
+-    // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
+-    // model file can drive cbi outside the table and launch whatever pointer lies
+-    // there. Bound both the input and the computed index.
+-    const BitsK bk = bits_from_K(K_);
+-    const int K = bk.bits;
+-    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
+-    TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
+-    TORCH_CHECK_SIZE(packed, 2, 16 * K + (bk.half ? 8 : 0));
+-    TORCH_CHECK_DTYPE(unpacked, kHalf);
+-
+-    int rows = packed.size(0);
+-    int packed_cols = packed.size(1);
+-
+-    if (unpacked.numel() == 0)
+-        return;
+-
+-    TORCH_CHECK(unpacked.size(1) % 128 == 0, "unpacked N dimension must be divisible by 128");
+-    TORCH_CHECK(n_offset % 128 == 0, "n_offset must be divisible by 128");
+-    TORCH_CHECK(n_offset >= 0, "n_offset must be non-negative");
+-    TORCH_CHECK(n_offset + unpacked.size(1) <= packed.size(1) * 16, "reconstruct slice exceeds packed tensor bounds");
+-
+-    int cols = unpacked.size(1) / 16;
+-    int packed_n_offset = n_offset / 16;
+-
+-    dim3 blockDim(256);
+-    dim3 gridDim(cols / 8, rows);
+-
+-    int cbi = K - 1;
+-    if (bk.half) cbi += 24;
+-    else if (mcg) cbi += 8;
+-    else if (mul1) cbi += 16;
+-    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_kernel_instances.size(),
+-                "kernel index out of range: ", cbi);
+-
+-    reconstruct_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+-    (
+-        (half*) unpacked.data_ptr(),
+-        (const uint16_t*) packed.data_ptr(),
+-        packed_cols,
+-        packed_n_offset
+-    );
+-    cuda_check(cudaPeekAtLastError());
+-}
+-
+-
+-// Fused reconstruct + both-side Hadamard: emits W = diag(suh) . H128 . W_hat . H128 . diag(svh)
+-// (per 128x128 tile, 1/sqrt(128) per side), i.e. the ORIGINAL-basis weights, so the hgemm
+-// prefill path can run on the raw input with no standalone input/output had_r_128 launches.
+-//
+-// 128x128 tile lives in shared memory with an XOR swizzle on the half4 chunk index
+-// (chunk ^= (row >> 2) & 31) making all phases bank-conflict-free except the 16-lane dequant
+-// scatter; both transforms reuse the natural-order Sylvester butterfly (symmetric, so
+-// column-then-row order is H W H).
+-#define RH_THREADS 256
+-
+-template <int K, int cb, bool HALF = false>
+-__device__ __forceinline__
+-void reconstruct_had_tile
+-(
+-    half* __restrict__ g_unpacked,
+-    const uint16_t* __restrict__ g_packed,
+-    const half* __restrict__ suh,
+-    const half* __restrict__ svh,
+-    int packed_blocks_n,
+-    int packed_n_offset
+-)
+-{
+-    constexpr int packed_size = 16 * K + (HALF ? 8 : 0);
+-    constexpr float r_scale = 0.08838834764831845f;
+-
+-    int t = threadIdx.x;
+-    int lane_id = t % 32;
+-    int warp_id = t / 32;
+-    int kb = blockIdx.y;
+-    int nb = blockIdx.x;
+-    int n = nb * 8;
+-    int row_len = gridDim.x * 128;
+-
+-    __shared__ uint32_t s_packed[8][8][packed_size / 2];
+-    __shared__ half2 stile[128 * 64];
+-
+-    auto tix = [&] (int R, int q, int p)
+-    {
+-        return R * 64 + (q ^ ((R >> 2) & 31)) * 2 + p;
+-    };
+-
+-    constexpr int j_int4 = packed_size / 8;
+-    for (int u = t; u < 8 * 8 * j_int4; u += RH_THREADS)
+-    {
+-        int j = u / (8 * j_int4);
+-        int r = u % (8 * j_int4);
+-        const uint16_t* gp = g_packed +
+-            ((size_t) ((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
+-        ((int4*) s_packed[j])[r] = ((const int4*) gp)[r];
+-    }
+-    __syncthreads();
+-
+-    for (int jj = 0; jj < 8 * 8 / (RH_THREADS / 32); ++jj)
+-    {
+-        int j = (warp_id / 8) * (8 / (RH_THREADS / 256)) + jj;
+-        int wn = warp_id % 8;
+-        register FragB frag[2];
+-        dq_dispatch<K, cb, HALF>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+-
+-        half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
+-        half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
+-        half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
+-        half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+-
+-        if (!(lane_id & 4))
+-        {
+-            half2 m0 = __halves2half2(__low2half(frag[0][0]), __low2half(n0));
+-            half2 m1 = __halves2half2(__high2half(frag[0][0]), __high2half(n0));
+-            half2 m2 = __halves2half2(__low2half(frag[0][1]), __low2half(n1));
+-            half2 m3 = __halves2half2(__high2half(frag[0][1]), __high2half(n1));
+-            half2 m4 = __halves2half2(__low2half(frag[1][0]), __low2half(n2));
+-            half2 m5 = __halves2half2(__high2half(frag[1][0]), __high2half(n2));
+-            half2 m6 = __halves2half2(__low2half(frag[1][1]), __low2half(n3));
+-            half2 m7 = __halves2half2(__high2half(frag[1][1]), __high2half(n3));
+-            int r0 = j * 16 + (lane_id % 4) * 2;
+-            int r1 = r0 + 1;
+-            int r2 = r0 + 8;
+-            int r3 = r0 + 9;
+-            int c0 = lane_id / 8;
+-            int q0 = (wn * 8 + c0) >> 1, p0 = c0 & 1;
+-            int q1 = (wn * 8 + c0 + 4) >> 1, p1 = c0 & 1;
+-            stile[tix(r0, q0, p0)] = m0;
+-            stile[tix(r1, q0, p0)] = m1;
+-            stile[tix(r2, q0, p0)] = m2;
+-            stile[tix(r3, q0, p0)] = m3;
+-            stile[tix(r0, q1, p1)] = m4;
+-            stile[tix(r1, q1, p1)] = m5;
+-            stile[tix(r2, q1, p1)] = m6;
+-            stile[tix(r3, q1, p1)] = m7;
+-        }
+-    }
+-    __syncthreads();
+-
+-    const half2 rs2 = __float2half2_rn(r_scale);
+-    constexpr int CHUNKS_PW = 32 / (RH_THREADS / 32);
+-    #pragma unroll
+-    for (int qq = 0; qq < CHUNKS_PW; ++qq)
+-    {
+-        int q = warp_id * CHUNKS_PW + qq;
+-        int qs = q ^ lane_id;
+-        // a[i]/b[i]: 4 columns x row (4 * lane + i), all four rows share swizzle == lane
+-        half2 a[4], b[4];
+-        #pragma unroll
+-        for (int i = 0; i < 4; ++i)
+-        {
+-            half4 v = *((const half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2));
+-            a[i] = v.x;
+-            b[i] = v.y;
+-        }
+-        // butterfly over the 4 rows, two columns at a time, fp16 with pre-applied scale
+-        #pragma unroll
+-        for (int x = 0; x < 2; ++x)
+-        {
+-            half2* v = x == 0 ? a : b;
+-            half2 s0 = __hadd2(v[0], v[1]), d0 = __hsub2(v[0], v[1]);
+-            half2 s1 = __hadd2(v[2], v[3]), d1 = __hsub2(v[2], v[3]);
+-            v[0] = __hmul2(__hadd2(s0, s1), rs2);
+-            v[1] = __hmul2(__hadd2(d0, d1), rs2);
+-            v[2] = __hmul2(__hsub2(s0, s1), rs2);
+-            v[3] = __hmul2(__hsub2(d0, d1), rs2);
+-            #pragma unroll
+-            for (int i = 0; i < 4; ++i)
+-                v[i] = shuffle_had_h2x32(v[i], lane_id);
+-        }
+-        #pragma unroll
+-        for (int i = 0; i < 4; ++i)
+-        {
+-            half4 v;
+-            v.x = a[i];
+-            v.y = b[i];
+-            *((half4*) (stile + (lane_id * 4 + i) * 64 + qs * 2)) = v;
+-        }
+-    }
+-    __syncthreads();
+-
+-    // Row transform fused with the store: after the lane butterfly, lane l holds the
+-    // FINAL columns 4l..4l+3 of row R. Apply the sign scales in registers and write the
+-    // coalesced 256-byte row directly.
+-    constexpr int ROWS_PW = 128 / (RH_THREADS / 32);
+-    const half4 sv4 = ((const half4*) svh)[nb * 32 + lane_id];
+-    #pragma unroll
+-    for (int rr = 0; rr < ROWS_PW; ++rr)
+-    {
+-        int R = warp_id * ROWS_PW + rr;
+-        int base = R * 64 + (lane_id ^ ((R >> 2) & 31)) * 2;
+-        half2 v01 = stile[base];
+-        half2 v23 = stile[base + 1];
+-        float v0 = __low2float(v01), v1 = __high2float(v01);
+-        float v2 = __low2float(v23), v3 = __high2float(v23);
+-        float s0 = v0 + v1, d0 = v0 - v1;
+-        float s1 = v2 + v3, d1 = v2 - v3;
+-        half2 h01 = __hmul2(__floats2half2_rn(s0 + s1, d0 + d1), rs2);
+-        half2 h23 = __hmul2(__floats2half2_rn(s0 - s1, d0 - d1), rs2);
+-        h01 = shuffle_had_h2x32(h01, lane_id);
+-        h23 = shuffle_had_h2x32(h23, lane_id);
+-        half2 su2 = __half2half2(suh[kb * 128 + R]);
+-        half4 v;
+-        v.x = __hmul2(__hmul2(h01, su2), sv4.x);
+-        v.y = __hmul2(__hmul2(h23, su2), sv4.y);
+-        *((half4*) (g_unpacked + (size_t) (kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
++// K is uniform for the block. Each branch calls the upstream tile decoder.
++__global__ __launch_bounds__(256)
++void reconstruct_mul1_job(half* unpacked, const ReconstructJob* job, int blocks_n) {
++    const uint16_t* packed = job->packed;
++    switch (job->bits) {
++        case 1: reconstruct_tile<1, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 2: reconstruct_tile<2, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 3: reconstruct_tile<3, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 4: reconstruct_tile<4, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 5: reconstruct_tile<5, 2, false>(unpacked, packed, blocks_n, 0); break;
++        case 6: reconstruct_tile<6, 2, false>(unpacked, packed, blocks_n, 0); break;
++        default: assert(false && "K12: expected integer K1..K6");
+@@ -363,14 +129,3 @@
+-
+-template <int K, int cb, bool HALF = false>
+-__global__ __launch_bounds__(RH_THREADS)
+-void reconstruct_had_kernel
+-(
+-    half* __restrict__ g_unpacked,
+-    const uint16_t* __restrict__ g_packed,
+-    const half* __restrict__ suh,
+-    const half* __restrict__ svh,
+-    int packed_blocks_n,
+-    int packed_n_offset
+-)
+-{
+-    reconstruct_had_tile<K, cb, HALF>(g_unpacked, g_packed, suh, svh, packed_blocks_n, packed_n_offset);
++void reconstruct_mul1(half* unpacked, const ReconstructJob* job,
++                       int k, int n, cudaStream_t stream) {
++    reconstruct_mul1_job<<<dim3(n / 128, k / 16), 256, 0, stream>>>(unpacked, job, n / 16);
+@@ -379,248 +134 @@
+-// Batched variant: blockIdx.z selects the matrix from per-matrix pointer tables, the outputs
+-// are consecutive [k, n] slabs out_stride halfs apart. Whole matrices only (no n slicing).
+-template <int K, int cb, bool HALF = false>
+-__global__ __launch_bounds__(RH_THREADS)
+-void reconstruct_had_batch_kernel
+-(
+-    half* __restrict__ g_unpacked,
+-    const uint16_t* const* __restrict__ packed_ptrs,
+-    const half* const* __restrict__ suh_ptrs,
+-    const half* const* __restrict__ svh_ptrs,
+-    int packed_blocks_n,
+-    size_t out_stride
+-)
+-{
+-    int b = blockIdx.z;
+-    reconstruct_had_tile<K, cb, HALF>
+-    (
+-        g_unpacked + (size_t) b * out_stride,
+-        packed_ptrs[b],
+-        suh_ptrs[b],
+-        svh_ptrs[b],
+-        packed_blocks_n,
+-        0
+-    );
+-}
+-
+-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+-#define __(i, cb) reconstruct_had_batch_kernel<i, cb>
+-constexpr auto reconstruct_had_batch_kernel_instances = std::array
+-{
+-    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+-    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+-    reconstruct_had_batch_kernel<1, 2, true>, reconstruct_had_batch_kernel<2, 2, true>, reconstruct_had_batch_kernel<3, 2, true>
+-};
+-#undef __
+-
+-// Index cb * 8 + K - 1 for integer K; 24 + K - 1 for the half-integer rates 1.5 / 2.5 / 3.5 (mul1 only)
+-#define __(i, cb) reconstruct_had_kernel<i, cb>
+-constexpr auto reconstruct_had_kernel_instances = std::array
+-{
+-    __(1, 0), __(2, 0), __(3, 0), __(4, 0), __(5, 0), __(6, 0), __(7, 0), __(8, 0),
+-    __(1, 1), __(2, 1), __(3, 1), __(4, 1), __(5, 1), __(6, 1), __(7, 1), __(8, 1),
+-    __(1, 2), __(2, 2), __(3, 2), __(4, 2), __(5, 2), __(6, 2), __(7, 2), __(8, 2),
+-    reconstruct_had_kernel<1, 2, true>, reconstruct_had_kernel<2, 2, true>, reconstruct_had_kernel<3, 2, true>
+-};
+-#undef __
+-
+-/*
+-Reconstruct in the original (unrotated) basis: fused suh/H/W_hat/H/svh. Both dims must be
+-multiples of 128. n_offset slices along n; svh must be pre-offset by the caller.
+-*/
+-void reconstruct_had_slice
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed,
+-    at::Tensor suh,
+-    at::Tensor svh,
+-    float K_,
+-    bool mcg,
+-    bool mul1,
+-    int64_t n_offset
+-)
+-{
+-    const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
+-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+-
+-    // The kernel-instance tables hold 24 entries: K in 1..8 x {plain, mcg, mul1}.
+-    // K is derived from the checkpoint (trellis.shape[-1] // 16), so an untrusted
+-    // model file can drive cbi outside the table and launch whatever pointer lies
+-    // there. Bound both the input and the computed index.
+-    const BitsK bk = bits_from_K(K_);
+-    const int K = bk.bits;
+-    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
+-    TORCH_CHECK_SHAPES(unpacked, 0, packed, 0, 16);
+-    TORCH_CHECK_SIZE(packed, 2, 16 * K + (bk.half ? 8 : 0));
+-    TORCH_CHECK_DTYPE(unpacked, kHalf);
+-    TORCH_CHECK_DTYPE(suh, kHalf);
+-    TORCH_CHECK_DTYPE(svh, kHalf);
+-
+-    if (unpacked.numel() == 0)
+-        return;
+-
+-    TORCH_CHECK(unpacked.size(0) % 128 == 0, "reconstruct_had: K dimension must be divisible by 128");
+-    TORCH_CHECK(unpacked.size(1) % 128 == 0, "reconstruct_had: N dimension must be divisible by 128");
+-    TORCH_CHECK(n_offset % 128 == 0, "n_offset must be divisible by 128");
+-    TORCH_CHECK(n_offset >= 0, "n_offset must be non-negative");
+-    TORCH_CHECK(n_offset + unpacked.size(1) <= packed.size(1) * 16, "reconstruct slice exceeds packed tensor bounds");
+-    TORCH_CHECK(suh.numel() >= unpacked.size(0), "reconstruct_had: suh size");
+-    TORCH_CHECK(svh.numel() >= unpacked.size(1), "reconstruct_had: svh size");
+-
+-    dim3 blockDim(256);
+-    dim3 gridDim(unpacked.size(1) / 128, unpacked.size(0) / 128);
+-
+-    int cbi = K - 1;
+-    if (bk.half) cbi += 24;
+-    else if (mcg) cbi += 8;
+-    else if (mul1) cbi += 16;
+-    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_kernel_instances.size(),
+-                "kernel index out of range: ", cbi);
+-
+-    reconstruct_had_kernel_instances[cbi]<<<gridDim, RH_THREADS, 0, stream>>>
+-    (
+-        (half*) unpacked.data_ptr(),
+-        (const uint16_t*) packed.data_ptr(),
+-        (const half*) suh.data_ptr(),
+-        (const half*) svh.data_ptr(),
+-        packed.size(1),
+-        (int) (n_offset / 16)
+-    );
+-    cuda_check(cudaPeekAtLastError());
+-}
+-
+-void reconstruct
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed,
+-    float K_,
+-    bool mcg,
+-    bool mul1
+-)
+-{
+-    TORCH_CHECK_SHAPES(unpacked, 1, packed, 1, 16);
+-    reconstruct_slice(unpacked, packed, K_, mcg, mul1, 0);
+-}
+-
+-
+-/*
+-Batched reconstruct_had over B whole matrices of one shape: unpacked is [B, k, n] fp16
+-(contiguous), packed_ptrs / suh_ptrs / svh_ptrs are int64 device tensors of B addresses of
+-[k/16, n/16, 16K] trellis tensors and their k-length suh / n-length svh vectors. One launch
+-dequantizes all B matrices into the original basis (see reconstruct_had_slice).
+-*/
+-void reconstruct_had_batch
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed_ptrs,
+-    at::Tensor suh_ptrs,
+-    at::Tensor svh_ptrs,
+-    float K_,
+-    bool mcg,
+-    bool mul1
+-)
+-{
+-    const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
+-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+-
+-    const BitsK bk = bits_from_K(K_);
+-    const int K = bk.bits;
+-    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
+-    TORCH_CHECK_DTYPE(unpacked, kHalf);
+-    TORCH_CHECK_DIM(unpacked, 3);
+-    TORCH_CHECK(unpacked.is_contiguous(), "reconstruct_had_batch: unpacked must be contiguous");
+-    TORCH_CHECK_DTYPE(packed_ptrs, kLong);
+-    TORCH_CHECK_DTYPE(suh_ptrs, kLong);
+-    TORCH_CHECK_DTYPE(svh_ptrs, kLong);
+-    TORCH_CHECK(packed_ptrs.device() == unpacked.device(), "reconstruct_had_batch: pointer tables must be on the output device");
+-    TORCH_CHECK(packed_ptrs.is_contiguous() && suh_ptrs.is_contiguous() && svh_ptrs.is_contiguous(),
+-                "reconstruct_had_batch: pointer tables must be contiguous");
+-
+-    int batch = unpacked.size(0);
+-    int k = unpacked.size(1);
+-    int n = unpacked.size(2);
+-    TORCH_CHECK(packed_ptrs.numel() >= batch && suh_ptrs.numel() >= batch && svh_ptrs.numel() >= batch,
+-                "reconstruct_had_batch: pointer table too short");
+-    if (!batch || !unpacked.numel())
+-        return;
+-    TORCH_CHECK(k % 128 == 0, "reconstruct_had_batch: K dimension must be divisible by 128");
+-    TORCH_CHECK(n % 128 == 0, "reconstruct_had_batch: N dimension must be divisible by 128");
+-
+-    dim3 blockDim(RH_THREADS);
+-    dim3 gridDim(n / 128, k / 128, batch);
+-
+-    int cbi = K - 1;
+-    if (bk.half) cbi += 24;
+-    else if (mcg) cbi += 8;
+-    else if (mul1) cbi += 16;
+-    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_had_batch_kernel_instances.size(),
+-                "kernel index out of range: ", cbi);
+-
+-    reconstruct_had_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+-    (
+-        (half*) unpacked.data_ptr(),
+-        (const uint16_t* const*) packed_ptrs.data_ptr(),
+-        (const half* const*) suh_ptrs.data_ptr(),
+-        (const half* const*) svh_ptrs.data_ptr(),
+-        n / 16,
+-        (size_t) k * n
+-    );
+-    cuda_check(cudaPeekAtLastError());
+-}
+-
+-
+-/*
+-Batched reconstruct over B whole matrices of one shape: unpacked is [B, k, n] fp16 (contiguous),
+-packed_ptrs an int64 device tensor of B addresses of [k/16, n/16, 16K] trellis tensors. One
+-launch dequantizes all B matrices (rotated basis, as reconstruct).
+-*/
+-void reconstruct_batch
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed_ptrs,
+-    float K_,
+-    bool mcg,
+-    bool mul1
+-)
+-{
+-    const at::cuda::OptionalCUDAGuard device_guard(unpacked.device());
+-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+-
+-    const BitsK bk = bits_from_K(K_);
+-    const int K = bk.bits;
+-    TORCH_CHECK(!bk.half || mul1, "reconstruct: half-integer bitrates require the mul1 codebook");
+-    TORCH_CHECK_DTYPE(unpacked, kHalf);
+-    TORCH_CHECK_DIM(unpacked, 3);
+-    TORCH_CHECK(unpacked.is_contiguous(), "reconstruct_batch: unpacked must be contiguous");
+-    TORCH_CHECK_DTYPE(packed_ptrs, kLong);
+-    TORCH_CHECK(packed_ptrs.device() == unpacked.device(), "reconstruct_batch: pointer table must be on the output device");
+-    TORCH_CHECK(packed_ptrs.is_contiguous(), "reconstruct_batch: pointer table must be contiguous");
+-
+-    int batch = unpacked.size(0);
+-    int k = unpacked.size(1);
+-    int n = unpacked.size(2);
+-    TORCH_CHECK(packed_ptrs.numel() >= batch, "reconstruct_batch: pointer table too short");
+-    if (!batch || !unpacked.numel())
+-        return;
+-    TORCH_CHECK(k % 16 == 0, "reconstruct_batch: K dimension must be divisible by 16");
+-    TORCH_CHECK(n % 128 == 0, "reconstruct_batch: N dimension must be divisible by 128");
+-
+-    dim3 blockDim(256);
+-    dim3 gridDim(n / 128, k / 16, batch);
+-
+-    int cbi = K - 1;
+-    if (bk.half) cbi += 24;
+-    else if (mcg) cbi += 8;
+-    else if (mul1) cbi += 16;
+-    TORCH_CHECK(cbi >= 0 && cbi < (int) reconstruct_batch_kernel_instances.size(),
+-                "kernel index out of range: ", cbi);
+-
+-    reconstruct_batch_kernel_instances[cbi]<<<gridDim, blockDim, 0, stream>>>
+-    (
+-        (half*) unpacked.data_ptr(),
+-        (const uint16_t* const*) packed_ptrs.data_ptr(),
+-        n / 16,
+-        (size_t) k * n
+-    );
+-    cuda_check(cudaPeekAtLastError());
+-}
++}  // namespace strata_exl3
+--- a/third_party/exllamav3_gpu/quant/reconstruct.cuh
++++ b/third_party/exllamav3_gpu/quant/reconstruct.cuh
+@@ -3 +3,3 @@
+-#include <ATen/Tensor.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++#include <cstdint>
+@@ -5,8 +7 @@
+-void reconstruct
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed,
+-    float K,
+-    bool mcg,
+-    bool mul1
+-);
++namespace strata_exl3 {
+@@ -14,9 +9,5 @@
+-void reconstruct_slice
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed,
+-    float K,
+-    bool mcg,
+-    bool mul1,
+-    int64_t n_offset
+-);
++// One projection, prepared on the device. No descriptor readback is needed.
++struct ReconstructJob {
++    const uint16_t* packed;
++    int bits;
++};
+@@ -24,11 +15,4 @@
+-void reconstruct_had_slice
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed,
+-    at::Tensor suh,
+-    at::Tensor svh,
+-    float K,
+-    bool mcg,
+-    bool mul1,
+-    int64_t n_offset
+-);
++// job is a DEVICE pointer. Output is row-major [k][n] fp16 in the Hadamard
++// basis, without scales or Hadamards. k % 16 == 0 and n % 128 == 0.
++void reconstruct_mul1(half* unpacked, const ReconstructJob* job,
++                       int k, int n, cudaStream_t stream);
+@@ -36,19 +20 @@
+-void reconstruct_had_batch
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed_ptrs,
+-    at::Tensor suh_ptrs,
+-    at::Tensor svh_ptrs,
+-    float K,
+-    bool mcg,
+-    bool mul1
+-);
+-
+-void reconstruct_batch
+-(
+-    at::Tensor unpacked,
+-    at::Tensor packed_ptrs,
+-    float K,
+-    bool mcg,
+-    bool mul1
+-);
++}  // namespace strata_exl3

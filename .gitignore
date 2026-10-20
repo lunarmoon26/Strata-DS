@@ -35,6 +35,10 @@ td.log
 /run-*.bat
 /run-*.sh
 /strata-*.json
+/run-deepseek-1017.sh.bak-*
+/strata-deepseek-1017.json.bak-*
+/.run-deepseek-1017.sh*
+/.strata-deepseek-1017.json*
 /strata-*.log
 /build-strata.bat
 /build-strata-cuda12.bat

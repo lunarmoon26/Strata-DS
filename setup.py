@@ -62,6 +62,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from tools import setup_deepseek_1017 as ds1017
+
 from strata_control import acquisition
 
 ROOT = Path(__file__).resolve().parent
@@ -5813,6 +5815,16 @@ def update_install(have: list, a) -> int:
         say("  No model is installed in this Strata folder yet: run START-HERE.bat (Linux: ./setup.sh) to set it up -")
         say("  it finds an earlier install's model files next to it and reuses them.")
         return 0
+    resident = [p for p in have if ds1017.is_profile(json.loads(p.read_text(encoding="utf-8-sig")))]
+    for cfg_path in resident:
+        try:
+            ds1017.check(ds1017.load_config(cfg_path))
+        except (ValueError, OSError, KeyError, IndexError) as e:
+            fail(str(e))
+    have = [p for p in have if p not in resident]
+    if not have:
+        ok("1017 assets checked; engine and packages unchanged; no server started")
+        return 0
     pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil")
     if not a.build:
@@ -5869,7 +5881,16 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
            layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
-    cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    original = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    if ds1017.is_profile(original):
+        if port is not None or gpu is not None or layer_split is not None or any(
+                v is not None for v in (keep or {}).values()):
+            fail("change 1017 settings with --family deepseek --model " + ds1017.MODEL + " --configure-only")
+        try:
+            return ds1017.start(cfg_path)
+        except (ValueError, OSError, KeyError, IndexError) as e:
+            fail(str(e))
+    cfg = upgrade_config(cfg_path, original)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -7037,14 +7058,22 @@ def main() -> int:
         _pf.adopt_user_defaults()
     except Exception:
         pass
-    if sys.platform == "darwin" and not CONTROL:       # a Mac: metal/setup_mac.py (the Metal engine); the app (Control mode) goes on below
+    resident_requested = "--configure-only" in sys.argv or any(
+        x in (ds1017.MODEL, "--model=" + ds1017.MODEL) for x in sys.argv)
+    if sys.platform == "darwin" and not CONTROL and not resident_requested:       # a Mac: metal/setup_mac.py
         return mac_setup(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES),
+    ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES) + ["deepseek"],
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, qwen36 = Qwen3.6-35B-A3B (pictures with --vision, "
                          "several requests at once with --parallel; docs/QWEN36.md)")
-    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *(m for f in PREVIEW_FAMILIES.values()
-                                                                       for m in f["models"])])))
+    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, ds1017.MODEL, *(m for f in PREVIEW_FAMILIES.values()
+                                                                        for m in f["models"])])))
+    ap.add_argument("--configure-only", action="store_true",
+                    help="1017 only: validate existing assets and write private launch files; no downloads, build or start")
+    ap.add_argument("--ds41-engine", help="1017: existing ds41_serve executable")
+    ap.add_argument("--telemetry-gpus", help="1017: two physical monitoring indices, independent of CUDA order")
+    ap.add_argument("--log-dir", help="1017: engine logs and shared service.lock directory")
+    ap.add_argument("--spec", choices=["none", "suffix", "dspark"], help="1017: greedy draft mode (default none)")
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -7158,6 +7187,38 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.model == ds1017.MODEL or a.configure_only or a.family == "deepseek":
+        if a.family != "deepseek" or a.model != ds1017.MODEL:
+            ap.error("this fork supports DeepSeek only as --family deepseek --model " + ds1017.MODEL)
+        unsupported = [x.split("=", 1)[0] for x in sys.argv[1:] if x.startswith("--")
+                       and x.split("=", 1)[0] not in ds1017.SUPPORTED_FLAGS]
+        if unsupported:
+            ap.error("unsupported for the resident 1017 profile: " + ", ".join(unsupported))
+        try:
+            if a.configure_only:
+                return ds1017.configure(a, ROOT)
+            if any(x.split("=", 1)[0] not in {"--family", "--model", "--yes"}
+                   for x in sys.argv[1:] if x.startswith("--")):
+                ap.error("use --configure-only to change the 1017 profile")
+            return ds1017.start(ROOT / ds1017.CONFIG_NAME)
+        except (ValueError, OSError, KeyError, IndexError) as e:
+            ap.error(str(e))
+    if any(x is not None for x in (a.ds41_engine, a.telemetry_gpus, a.log_dir, a.spec)):
+        ap.error("1017-specific flags require its explicit --family deepseek --model " + ds1017.MODEL)
+    if (ROOT / ds1017.CONFIG_NAME).is_file() and not any((
+            a.family, a.model, a.setup, a.check, a.no_start, a.inspect, a.rollback_engine)):
+        installed = installed_configs()
+        if len(installed) == 1 and ds1017.is_profile(json.loads(installed[0].read_text())):
+            if any(x not in ("--yes", "--update") for x in sys.argv[1:]):
+                ap.error("change 1017 settings through its explicit --configure-only profile")
+            try:
+                if a.update:
+                    ds1017.check(ds1017.load_config(installed[0]))
+                    ok("1017 assets checked; engine and packages unchanged; no server started")
+                    return 0
+                return ds1017.start(installed[0])
+            except (ValueError, OSError, KeyError, IndexError) as e:
+                ap.error(str(e))
     if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES:
         ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in PREVIEW_FAMILIES.items()
                                                               if a.model in d["models"]))

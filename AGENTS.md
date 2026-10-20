@@ -14,6 +14,13 @@ or an Apple Silicon Mac. Version 0.2.0-beta, engine 0.1.45.3. It has three parts
 
 ## Installing Strata for a user
 
+This branch also carries an **opt-in resident DeepSeek 1017 port candidate**.
+Follow [docs/DEEPSEEK_1017.md](docs/DEEPSEEK_1017.md) for that profile, not the
+Terminal's Qwen download workflow below. It reuses existing pinned EXL3 assets,
+requires two resident CUDA stages, and supports configure-only installation.
+Do not download or requantize weights, start another model-sized GPU process,
+or replace the existing serving checkout to validate this candidate.
+
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**. For an agent that has a shell, the short version is:
 
 1. Install the Terminal. It needs no administrator rights.

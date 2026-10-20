@@ -4,6 +4,37 @@
 # Python (with venv) is installed through apt/dnf if it is missing (asks for sudo).
 # NixOS (or STRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
 cd "$(dirname "$0")" || exit 1
+# Resident 1017 setup is offline and never creates/repairs a Python environment.
+OFFLINE_1017=0
+PREVIOUS=""
+for arg in "$@"; do
+  case "$arg" in
+    --configure-only|--model=1017-EXL3-2.7BPW) OFFLINE_1017=1 ;;
+  esac
+  if [ "$PREVIOUS" = --model ] && [ "$arg" = 1017-EXL3-2.7BPW ]; then OFFLINE_1017=1; fi
+  PREVIOUS="$arg"
+done
+if [ -f strata-deepseek-1017.json ] && grep -q '"_generated_by": "Strata/setup.py:deepseek-1017"' strata-deepseek-1017.json; then
+  COUNT=0
+  for cfg in strata-*.json; do
+    case "$cfg" in *.shared-settings.json) continue ;; esac
+    [ ! -f "$cfg" ] || COUNT=$((COUNT + 1))
+  done
+  if [ "$COUNT" = 1 ] && { [ "$#" = 0 ] || { [ "$#" = 1 ] && [ "$1" = --update ]; }; }; then
+    OFFLINE_1017=1
+  fi
+fi
+if [ "$OFFLINE_1017" = 1 ] || [ -n "${STRATA_PYTHON:-}" ]; then
+  PY="${STRATA_PYTHON:-}"
+  if [ -z "$PY" ]; then
+    if [ -x .venv/bin/python ]; then PY=.venv/bin/python; else PY=python3; fi
+  fi
+  "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || {
+    echo 'Set STRATA_PYTHON to an existing Python 3.10+ serving environment.' >&2
+    exit 1
+  }
+  exec "$PY" setup.py "$@"
+fi
 # A bundled Python runtime (the python/ folder of the terminal archive) is used when it is there: nothing to find,
 # install or download. update.sh runs this file, so it uses it too.
 if [ -x python/bin/python3 ]; then
