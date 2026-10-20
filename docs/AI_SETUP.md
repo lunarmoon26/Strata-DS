@@ -1,6 +1,6 @@
 # Installing Strata for a user (instructions for AI agents)
 
-For this fork's optional resident DeepSeek 1017 candidate, use
+For this fork's optional experimental resident DeepSeek 1017 backend, use
 [DEEPSEEK_1017.md](DEEPSEEK_1017.md). The explicit configure-only profile uses
 pre-provisioned assets and never downloads, builds, quantizes or starts a model.
 The upstream Terminal/default-model setup instructions below are unchanged and

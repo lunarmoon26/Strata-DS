@@ -2,7 +2,7 @@
 
 This fork's optional **DeepSeek 1017 resident backend** has a separate
 [port contract and build/setup guide](DEEPSEEK_1017.md). It is not the upstream
-Qwen layer-split path described below, and remains an undeployed candidate.
+Qwen layer-split path described below. See that guide for its validation status.
 
 One model can run across several NVIDIA cards in one PC. The layers are split into contiguous ranges, one per GPU:
 the first card runs layers 0 to K-1, the next card runs K onward, and so on; the last card also runs the output head

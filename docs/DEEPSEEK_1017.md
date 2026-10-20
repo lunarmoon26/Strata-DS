@@ -2,9 +2,8 @@
 
 **Status:** upstream-based source port, not the deployed engine. The base is
 `Niko1221/Strata@e88ee39d1d6be6e3364183af3b39b62a7ed6f211`.
-The pre-migration history is retained on `legacy/pre-upstream-1017`. Local
-installer edits, model packs and the running server remain unchanged. Updating
-the code's ancestry does not change GitHub's displayed fork-parent metadata.
+Local installer edits, model packs and the running server remain unchanged.
+Backups stay local; the public repository contains only the `main` branch.
 
 ## Scope and source ownership
 
