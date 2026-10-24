@@ -28,4 +28,14 @@ void exl3_moe_prefill(const __half* x, const int32_t* tok, const float* w, const
                       const Exl3Expert* experts, float* out, void* workspace, size_t workspace_bytes,
                       cudaStream_t stream);
 
+/// Experimental resident path: GPU route grouping and tiled packed mul1 GEMM.
+/// No allocation, reconstruction arena or host route/count readback. K1..K6 may
+/// differ across projections. residency maps expert ids to resident descriptors;
+/// null is identity. ids[tokens,topk] accepts -1 padding; topk <=6, tokens <=1024.
+/// active_groups, if supplied, is a stream-ordered additive device counter.
+size_t exl3_moe_grouped_workspace_bytes(int tokens,int topk,int groups);
+void exl3_moe_prefill_grouped(const __half* x,const int32_t* ids,const float* weights,int tokens,int topk,
+                             const Exl3Expert* experts,const int32_t* residency,int groups,float* out,
+                             void* workspace,size_t bytes,int32_t* active_groups,cudaStream_t stream);
+
 }  // namespace strata::ds41::kernels

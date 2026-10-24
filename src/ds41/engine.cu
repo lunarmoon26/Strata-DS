@@ -1518,6 +1518,7 @@ struct Engine::Impl {
     struct PfProfile {
         enum { kEngram, kHc, kProj, kComp, kIndexer, kAttn, kOut, kRouter, kExperts, kShared, kHead, kN };
         bool on = false;
+        int begin = 0, end = kLayers;
         std::vector<cudaEvent_t> ev;
         std::vector<int> cat;
         size_t n = 0;
@@ -1545,7 +1546,7 @@ struct Engine::Impl {
                 t[cat[i]] += ms;
                 total += ms;
             }
-            std::fprintf(stderr, "ds41 prefill profile (GPU timeline, %.0f ms):", total);
+            std::fprintf(stderr, "ds41 prefill profile stage %d..%d (GPU timeline incl. host gaps, %.0f ms):", begin, end-1, total);
             for (int c = 0; c < kN; ++c) std::fprintf(stderr, " %s %.0f ms (%.0f%%);", names[c], t[c], 100 * t[c] / total);
             std::fprintf(stderr, "\n");
             n = 0;
@@ -1556,6 +1557,8 @@ struct Engine::Impl {
     /// carved from lent VRAM tier slots or cudaMalloc; the ring separately
     struct Prefill {
         int cap = 0, sub = 0;
+        bool grouped = false;
+        int32_t* active_groups = nullptr;
         uint8_t* lent = nullptr;                 // lent VRAM tier slots (scratch, ring or both)
         uint8_t* own_scratch = nullptr;          // or cudaMalloc
         uint8_t* own_ring = nullptr;
@@ -1667,8 +1670,10 @@ struct Engine::Impl {
         p.eng_dev = carve<uint8_t>(base, u, std::max<size_t>((size_t) n_eng * b * kEngRows * (256 + 8), 1));
         p.desc = carve<kernels::Exl3Expert>(base, u, 2 * kExperts);
         p.k2_ws = carve<uint8_t>(base, u, b * (size_t) max_k * 4);
-        p.k12_bytes = kernels::exl3_moe_prefill_workspace_bytes(cap * kTopK, kExperts);
+        p.k12_bytes = p.grouped ? kernels::exl3_moe_grouped_workspace_bytes(cap, kTopK, kExperts)
+                               : kernels::exl3_moe_prefill_workspace_bytes(cap * kTopK, kExperts);
         p.k12_ws = carve<uint8_t>(base, u, p.k12_bytes);
+        if (p.grouped) p.active_groups = carve<int32_t>(base, u, 1);
         p.k14_bytes = kernels::indexer_topk_prefill_workspace_bytes(sub, max_seq);
         p.k14_ws = carve<uint8_t>(base, u, p.k14_bytes);
         p.k15_bytes = kernels::hc_mixes_pre_rows_workspace_bytes(sub);
@@ -1682,10 +1687,30 @@ struct Engine::Impl {
     /// sub-batch (up to opt.prefill_batch) and ring (opt.prefill_ring, at least 16 slots) that fit.
     void prefill_begin(int n) {
         DeviceScope scope(stage.device);
+        const char* profile = std::getenv("DS41_PF_PROFILE");
+        pfp.on = profile && profile[0] && profile[0]!='0';
+        pfp.begin=stage.begin;pfp.end=stage.end;
+        pfp.n=0;
+        const char* grouped = std::getenv("DS41_PF_GROUPED");
+        const bool use_grouped = grouped && grouped[0] && grouped[0]!='0';
+        if (use_grouped && (!partitioned() || tensor || pack.has_mcg()))
+            throw std::invalid_argument("DS41_PF_GROUPED requires resident layer-split mul1 prefill");
         if (partitioned()) {
             // Never lend resident expert slots or construct an expert stream.
             // Bounded chunk/sub-batch scratch only; keep >=512 MiB driver reserve.
             pf = Prefill{};
+            pf.grouped=use_grouped;
+            if (pf.grouped) {
+                // Validate descriptors once on the host, never read routes back.
+                for (int l=stage.begin;l<stage.end;++l) for (int e=0;e<kExperts;++e) {
+                    const int slot=vram->res_host()[size_t(l)*kExperts+e];
+                    if (slot<0) throw std::runtime_error("grouped prefill: missing resident expert");
+                    const auto& d=vram->desc(slot);
+                    for (const auto* p:{&d.w1,&d.w3,&d.w2})
+                        if(p->codebook!=2 || p->shard_count!=1 || p->tile_w%16 || p->tile_w<16 || p->tile_w>96)
+                            throw std::runtime_error("grouped prefill: unsupported expert descriptor");
+                }
+            }
             int cap = std::max(1, std::min({n, opt.prefill_chunk, 1024}));
             int sub = std::max(1, std::min({cap, opt.prefill_batch, 512}));
             size_t free_b = 0, total_b = 0;
@@ -1706,10 +1731,10 @@ struct Engine::Impl {
             alloc_prefill_host(cap);
             std::fprintf(stderr, "ds41 resident prefill: stage %d..%d chunk %d batch %d scratch %.3f GiB + dense %.3f GiB; no expert eviction\n",
                          stage.begin, stage.end - 1, cap, sub, scratch / 1073741824., dense_bytes / 1073741824.);
+            if (pf.grouped) std::fprintf(stderr,"ds41 resident prefill: grouped packed EXL3 enabled\n");
             return;
         }
         pf = Prefill{};
-        if (const char* v = std::getenv("DS41_PF_PROFILE")) pfp.on = v[0] && v[0] != '0';
         // a ring slot holds any expert of the pack (upstream: MAXBLOB); the tier's slots may be smaller
         for (int l = 0; l < kLayers; ++l)
             for (int e = 0; e < kExperts; ++e) pf.slot_bytes = std::max<size_t>(pf.slot_bytes, pack.expert(l, e).bytes);
@@ -2002,6 +2027,14 @@ struct Engine::Impl {
     /// by expert, VRAM tier experts first (one K12 call from their slots), then the streamed experts in job order
     /// (one K12 call per group of ring slots, each released when its call has run). Each expert is copied once.
     void moe_experts(int l, int S) {
+        if (pf.grouped) {
+            pfp.mark(PfProfile::kExperts);
+            ck(cudaMemsetAsync(pf.routed,0,size_t(S)*kDim*sizeof(float),0),"grouped routed reset");
+            kernels::exl3_moe_prefill_grouped(reinterpret_cast<const __half*>(pf.x_half),pf.ids,pf.wts,S,kTopK,
+                vram->experts_dev(),vram->res_dev()+size_t(l)*kExperts,kExperts,pf.routed,
+                pf.k12_ws,pf.k12_bytes,pf.active_groups,0);
+            return;
+        }
         pfp.mark(PfProfile::kRouter);
         ck(cudaMemcpyAsync(pfh.ids, pf.ids, (size_t) S * kTopK * 4, cudaMemcpyDeviceToHost, 0), "routes down");
         ck(cudaMemcpyAsync(pfh.wts, pf.wts, (size_t) S * kTopK * 4, cudaMemcpyDeviceToHost, 0), "weights down");
@@ -2158,6 +2191,8 @@ struct Engine::Impl {
     /// One pass: tokens[c0 .. c0 + S) at positions p0 ..; with nll, the nll of every next token inside `tokens`.
     void prefill_pass(const std::vector<int>& tokens, int c0, int S, int p0, std::vector<float>* nll) {
         DeviceScope scope(stage.device);
+        pfp.mark(PfProfile::kHc);
+        if (pf.grouped) ck(cudaMemsetAsync(pf.active_groups,0,sizeof(int32_t),0),"grouped count reset");
         if (stage.begin == 18) cur_comp = incoming_comp;
         const int B = pf.sub;
         for (int i = 0; i < S; ++i) history.push_back(pack.engram_hash().token_map[tokens[c0 + i]]);
@@ -2260,10 +2295,17 @@ struct Engine::Impl {
                 throw PrefillCancelled();   // prefill_end stops the stream and syncs; prefill() resets
         }
         const int n = (int) tokens.size();
+        if (pf.grouped) {
+            int32_t groups=0;
+            ck(cudaMemcpy(&groups,pf.active_groups,sizeof(groups),cudaMemcpyDeviceToHost),"grouped count down");
+            ptm->vram_experts+=groups;
+        }
         ck(cudaMemcpyAsync(h, pf.h + size_t(S - 1) * kHc * kDim, kHc * kDim * 2, cudaMemcpyDeviceToDevice, 0), "prefill last hidden");
         ck(cudaMemcpyAsync(ffn_pre, pf.pre_mix + size_t(S - 1) * kHc, kHc * 4, cudaMemcpyDeviceToDevice, 0), "prefill last HC");
         if (stage.end != kLayers) {
+            pfp.mark(PfProfile::kHead);
             ck(cudaStreamSynchronize(0), "first stage prefill complete");
+            pfp.report();
             return;
         }
         if (nll) {

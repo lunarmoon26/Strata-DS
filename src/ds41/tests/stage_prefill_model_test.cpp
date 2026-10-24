@@ -8,6 +8,9 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
 
 using namespace strata::ds41;
 void require(bool ok, const char* msg) { if (!ok) throw std::runtime_error(msg); }
@@ -19,7 +22,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     try {
         std::string pack, ids, out;
-        int maxseq = 4096, chunk = 512, batch = 256, sequential = 1, force_host = 0;
+        int maxseq = 4096, chunk = 512, batch = 256, sequential = 1, force_host = 0, dspark = 0;
         for (int i = 1; i < argc; i += 2) {
             require(i + 1 < argc, "missing value"); const std::string a = argv[i];
             if (a == "--pack") pack = argv[i + 1];
@@ -30,6 +33,7 @@ int main(int argc, char** argv) {
             else if (a == "--batch") batch = std::stoi(argv[i + 1]);
             else if (a == "--sequential") sequential = std::stoi(argv[i + 1]);
             else if (a == "--force-host") force_host = std::stoi(argv[i + 1]);
+            else if (a == "--dspark") dspark = std::stoi(argv[i + 1]);
             else throw std::invalid_argument("unknown option " + a);
         }
         require(!out.empty(), "needs output directory");
@@ -40,7 +44,10 @@ int main(int argc, char** argv) {
         EngineOptions opt; opt.devices = {0, 1}; opt.split_layer = 18; opt.max_seq = maxseq;
         opt.cpu_threads = 2; opt.ram_budget_gib = 0; opt.adapt_every = 0; opt.prefill_chunk = chunk;
         opt.prefill_batch = batch; opt.vram_reserve_bytes = 2ull << 30; opt.snapshots = 2; opt.force_host_handoff = force_host;
+        require(dspark == 0 || dspark == 1, "dspark must be 0 or 1");
+        opt.dspark = dspark;
         Engine e(pack, opt); require(e.vram_expert_slots() == kLayers * kExperts, "missing experts");
+        require(e.has_dspark() == bool(dspark), "DSpark profile mismatch");
         std::vector<float> ref; int ref_next = -1;
         if (sequential) {
             StepDump dump;
@@ -106,6 +113,12 @@ int main(int argc, char** argv) {
             const auto& t = e.last_timing(); require(t.expert_hits == 240 && !t.cpu_experts() && !t.skipped, "expert fallback");
         }
         std::printf("GENERATED:"); for (int token : generated) std::printf(" %d", token); std::puts("");
+        require(e.position() > pos && e.position() <= maxseq, "continuation outside context capacity");
+        std::printf("CONTINUATION prefill_position=%d final_position=%d capacity=%d dspark=%d\n", pos, e.position(), maxseq, dspark);
+#ifdef __linux__
+        struct rusage usage{}; require(getrusage(RUSAGE_SELF, &usage) == 0, "getrusage");
+        std::printf("MEMORY process_peak_rss_kib=%ld reused_prompt_tokens=0\n", usage.ru_maxrss);
+#endif
         if (sequential) {
             e.reset(); const int replay = e.prefill(prompt, 0); finite(e);
             require(replay == generated[0], "reset prefill next differs");

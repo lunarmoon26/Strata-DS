@@ -13,7 +13,7 @@ add_library(strata_ds41_engine STATIC
   src/ds41/kernels/fp8_gemv.cu src/ds41/kernels/k2_fp8_gemm.cu
   src/ds41/kernels/k3_sparse_attn.cu src/ds41/kernels/k5_indexer.cu
   src/ds41/kernels/k7_hc.cu src/ds41/kernels/k8_router.cu
-  src/ds41/kernels/k10_exl3_moe.cu src/ds41/kernels/k12_exl3_moe_prefill.cu
+  src/ds41/kernels/k10_exl3_moe.cu src/ds41/kernels/k12_exl3_moe_prefill.cu src/ds41/kernels/k12_grouped.cu
   src/ds41/kernels/k13_sparse_attn_prefill.cu src/ds41/kernels/k14_indexer_prefill.cu
   src/ds41/kernels/k15_hc_prefill.cu)
 target_include_directories(strata_ds41_engine PUBLIC include PRIVATE third_party/exllamav3_moe ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -61,7 +61,7 @@ if(STRATA_DS41_STAGE_TESTS)
   target_link_libraries(ds41_exl3_prefill_experts_test PRIVATE strata_ds41_engine)
   add_test(NAME ds41_exl3_prefill_experts COMMAND ds41_exl3_prefill_experts_test --component-only)
   set_tests_properties(ds41_exl3_prefill_experts PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
-  foreach(test stage_model_smoke stage_prefill_model stage_serving_model speculation_model)
+  foreach(test stage_model_smoke stage_prefill_model stage_serving_model speculation_model prefill_benchmark)
     add_executable(ds41_${test}_test src/ds41/tests/${test}_test.cpp)
     target_link_libraries(ds41_${test}_test PRIVATE strata_ds41_engine)
   endforeach()

@@ -71,6 +71,159 @@ these GPUs. Starting the generated launcher is a separate, manual operation.
 
 ## Acceptance and limitations
 
+### Prefill optimization — opt-in grouped EXL3 experiment
+
+The experiment retains the pinned source bytes, full 524288 configured capacity,
+resident backbone experts and the chosen layer/DSpark mode. It runs in a
+separate development checkout; no installed defaults or service state change.
+Phase profiling is wired on both resident stages. GPU-grouped EXL3 expert prefill
+uses bounded scratch, FP32 projection outputs and the existing Hadamard/activation
+rounding. The candidate is opt-in with `DS41_PF_GROUPED=1` in the development build.
+The existing reconstructed-GEMM path remains the baseline and default.
+
+The grouped path takes routing counts and row/job tables directly from the GPU,
+handles independent per-projection bit rates and separate gate/up sign vectors,
+and reduces expert contributions in a deterministic order. It does not import
+another model, a host expert tier, lossy int8 activation arithmetic or a new KV
+cache format. Gate, up and down use separate packed-weight GEMM launches, with
+64 rows per job and no reconstructed full matrices. Their Hadamards remain
+separate, preserving independent gate/up sign vectors. The gate/up input arena
+is reused for down outputs only after both input consumers finish. Grouped-kernel
+scratch grows with at most 1024 tokens, not sequence capacity or expert-weight size.
+Existing attention/indexer scratch still depends on configured capacity.
+One aggregate active-expert count is read per stage/chunk; routes and weights
+remain on the GPU. This is a layer-split mul1 path, not TP2, MCG or expert streaming.
+
+The tiled MMA loop adapts Diffbot's MIT-licensed
+[`xmoe_do/do_gemm.cu`](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000/blob/58799d945d0f836fdb575e3a39a662b0a4d1543c/recipe/kernels/xmoe_do/do_gemm.cu).
+Its notice is retained in `third_party/diffbot_exl3/LICENSE`. No alternate model
+or converted deployment pack is imported. SGLang's asynchronous chunk scheduling
+and FlashInfer's indexed-cache attention remain design references, not dependencies.
+
+Synthetic tests compare with the current K12 path before model-sized timing.
+Acceptance covers predictive distributions, continuation, snapshot/cancel/reset
+and unchanged default-path logits. Optimized GEMM is not expected to be
+bit-identical to reconstructed cuBLAS GEMM. Timings use identical prompt IDs,
+configured capacity and speculation settings, with warm-up separate. Report the
+actual selected chunk/batch: extra scratch or lazy allocations can reduce them.
+No speedup is assumed for unmeasured prompts or devices.
+
+`DS41_PF_PROFILE=1` prints each resident stage/chunk's phase timeline, including
+host gaps between GPU events. It is not a kernel-only profiler or complete TTFT:
+use external wall-clock timing for allocation, stage transfers and cleanup too.
+`ds41_prefill_benchmark_test` is an explicit model benchmark, not an automatic
+CTest. It requires local `--pack` and `--ids-file` arguments, resets before every
+round (zero prefix reuse), separates warm-up and timed repeats, and can write/read
+full-logit references with `--reference-out` / `--reference-in`. The reference
+gate requires equal argmax, KL <0.02 and relative L2 <0.25; it is a regression
+check, not an independent model-quality oracle. Default capacity is 524288.
+
+The next stages, after this numerical/performance gate, adapt asynchronous
+chunked pipeline scheduling and study direct indexed KV access. They are not
+implemented or qualified by the grouped-kernel experiment alone.
+
+#### Local grouped-prefill qualification — 2026-10-24
+
+CUDA 13.4 / GCC 15 / SM120 builds and all 15 component CTests pass. The grouped
+tests cover independent K1..K6 projections, both activation-rounding profiles,
+empty rows, remapped resident slots, multi-job tails, 1024-token skewed routing,
+short-workspace refusal, and poisoned-scratch CUDA graph replay. Maximum observed
+relative L2 against existing K12 is 0.000528. At 1024 tokens the grouped workspace
+is about 255 MiB; it is about 128 MiB at 512 tokens.
+
+Real-weight checks retain 524288 configured capacity. The 513-token retrieval
+returns `BRONZE-73921`, agrees predictively with sequential execution (KL
+3.54e-8), and passes snapshot continuation, deterministic reset and cancellation
+recovery. With DSpark enabled, serving-state checks pass full-logit verification
+and prefix commits 1..4, rejected-tail rollback, boundaries 127/128/511/512,
+isolated slots, published drafting and cancellation/retry. These checks compare
+the engine with itself, not an independent model oracle. The 36 CPU
+installer/tokenizer/mock-HTTP tests, six lossless dense-packer tests and six
+deployment-wrapper tests also pass; no real HTTP claim follows.
+
+Matched native prefill uses the same frozen 16384-token source-code fixture,
+layer split 18/22, DSpark enabled, 524288 capacity, one snapshot, requested and
+selected chunk/batch 512/256, zero prefix reuse, one warm-up and three measured
+rounds. Two RTX PRO 6000 GPUs, 16 GiB host-memory limit, no cgroup swap and a
+two-CPU quota are unchanged. Timing surrounds `Engine::prefill`, including its
+scratch allocation, transfers and cleanup, but excludes model load, tokenization
+and HTTP. This is a warm-engine/cold-prefix test, not cold service startup.
+
+| Native prefill path | Median seconds | Tokens/s |
+| --- | ---: | ---: |
+| Default reconstructed GEMM | 32.064 | 510.976 |
+| Opt-in grouped packed GEMM | 12.363 | 1325.218 |
+
+This fixture improves 2.59x (61.4% less prefill time). The default path's logits
+remain byte-identical to the pre-optimization reference on the same fixture.
+The default path also reproduces the published build's saved full logits for
+both batched and sequential execution on the historical 513-token retrieval.
+Grouped logits are deterministic but not byte-identical: equal next token,
+relative L2 0.05923 and KL 0.01216 against that reference. The scratch-sharing
+revision preserves the earlier grouped prototype's logits byte for byte. These
+results do not establish general coding quality or long-context throughput.
+
+Observed cgroup memory peaks are 7.20 GiB default / 7.85 GiB grouped, including
+file cache; process peak RSS is about 0.83 / 0.82 GiB. GPU total-use peaks sampled
+every 0.5 s are about 94.5/93.3 GiB default and 94.3/93.3 GiB grouped, including
+unrelated existing desktop processes. No cgroup swap or expert streaming occurs.
+
+The **requested 512-batch trial fails exact replay**: it initially selects
+512/512, then the second measured round selects 256/256 on the tail stage and
+produces different logits. Its faster partial timing is not a qualified result.
+The failure is retained, the replay gate is not relaxed, and batch 256 stays the
+measured choice. No installer settings or generated configuration are changed.
+
+Separate profiled 16K runs put the routed-expert phase at about 23.70 s default
+versus 4.48 s grouped. In the grouped GPU-event timeline, routed experts now
+account for 36%, HC mixes/norms 23% (2.82 s), and Engram 17% (2.16 s). These
+rounded phase totals include host gaps and exclude inter-stage transfer gaps;
+they are not Nsight kernel attribution. They motivate measuring HC work, Engram
+overlap and stage handoffs next rather than assuming attention dominates.
+
+Long-input qualification passes with actual 65536- and
+524256-token retrieval inputs, each in a single 524288-token conversation with
+32 or more tokens of generation headroom. Fresh default/grouped runs use the
+same frozen prompt IDs, layer/DSpark mode and selected chunk/batch; each must
+return the exact needle, retain resident backbone experts, stay within capacity,
+and reproduce snapshot continuation. Full-logit comparisons retain the existing
+equal-argmax, KL <0.02 and relative-L2 <0.25 gates. Resource receipts retain
+memory/swap/oom observations and failed attempts. No sequential decode of the
+entire long input or independent-model quality claim is implied.
+
+Each row below is one actual prefill in a fresh engine, with DSpark enabled and
+no prefix reuse. All four runs use the same test binary, 524288 capacity, layer
+split 18/22, two snapshots and selected chunk/batch 512/256. Prefill timing
+excludes model load, tokenization and HTTP. This repeated-background retrieval
+fixture is not the 16K source-code performance workload; these are single-run
+qualification timings, not warm-repeat medians.
+
+| Actual input tokens | Path | Prefill seconds | Tokens/s |
+| ---: | --- | ---: | ---: |
+| 65536 | Default | 65.291 | 1003.757 |
+| 65536 | Grouped | 34.411 | 1904.510 |
+| 524256 | Default | 628.750 | 833.807 |
+| 524256 | Grouped | 378.557 | 1384.878 |
+
+Grouped prefill improves 1.90x at 64K and 1.66x on the actual 524256-token input.
+Every run returns exactly `BRONZE-73921`, passes full-logit snapshot continuation,
+and uses only resident backbone experts. Final positions are 65542 and 524262,
+respectively, within the single-conversation 524288 limit. The 524256-token
+fixture is byte-identical to the historical full-input fixture; its baseline is
+a fresh run of the current default path, not a reused historical timing.
+
+Predictive comparisons retain equal argmax and the original gates: at 64K,
+KL is 6.18e-7 and relative L2 is 0.13284; at 524256, KL is 7.93e-8 and relative
+L2 is 0.16324. Optimized logits are not bit-identical to the default path.
+No expert streaming, cgroup swap or OOM event occurs. Maximum observed cgroup
+memory across the four runs is about 9.36 GiB under the 16 GiB limit, including
+file cache. These checks establish actual-input retrieval and greedy continuation,
+not independent broad quality or full-context speculative-decode throughput.
+
+Broad model quality, current container GPU runtime and
+cross-backend portability remain unqualified for this experiment. The installed
+deployment and its stopped-service state remain unchanged.
+
 ### Tensor parallelism and non-replay verification
 
 The requested extension adds an opt-in tensor-parallel mode alongside the
@@ -177,6 +330,12 @@ The following programs are explicitly model-sized, not automatic CTests. Stop th
 model service first, use the same shared `service.lock`, and run only one at a
 time. Supply the existing lossless `--pack` and a comma-separated `--ids-file`.
 
+- `ds41_stage_prefill_model_test --out ... --max-seq 524288 --chunk 512
+  --batch 256 --sequential 0 --dspark 1`: one actual batched prefill, saved full
+  logits, exact snapshot continuation and up to 24 greedy output tokens. Create
+  a fresh output directory first and independently check the input token count.
+  `--sequential 0` skips feeding the entire long prompt token by token; it does
+  not skip prefill or continuation. `DS41_PF_GROUPED=1` selects the candidate.
 - `ds41_stage_serving_model_test --dspark 1`: full-logit prefix commits 1–4,
   ring/index/compressor boundaries 127/128/511/512, session isolation, draft
   replay and cancellation. Add `--tensor 1 --max-seq 524288` for TP2 with full
@@ -238,10 +397,12 @@ does not qualify the full context or every API path.
   524288 configured capacity. The actual 524256-token rerun and queued follow-up
   checks were cancelled at the user's request, not counted as passes.
 
-Still unverified: complete actual 524K input, fresh real-model API qualification,
+At this historical checkpoint, unverified: complete actual 524K input, fresh real-model API qualification,
 broad numerics/quality/performance, and container GPU runtime. No full
 upstream-suite or cross-backend build coverage is claimed. Private failed and
 cancelled receipts remain local.
+The later grouped-prefill qualification above closes actual-524K input for the
+layer-split default/grouped paths; it does not change the cancelled run's status.
 
 ### TP2 / non-replay DSpark experiment — 2026-10-20
 
@@ -363,5 +524,8 @@ Completed qualification:
   `BRONZE-73921`. Both its batched-prefill and sequential logits are byte-identical
   to the previous published binary; snapshot, reset and cancellation checks pass.
 
-The persistent service remains stopped. No fresh real-model HTTP, full-524K input, independent
-full-model reference, broad coding-quality or container qualification is claimed.
+The persistent service remains stopped. These earlier checks do not establish
+fresh real-model HTTP, full-524K input, an independent full-model reference,
+broad coding quality or container qualification. Later layer-split actual-input
+evidence is recorded in the grouped-prefill qualification above; TP2's actual
+full-524K input remains unqualified.

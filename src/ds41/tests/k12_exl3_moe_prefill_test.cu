@@ -6,6 +6,7 @@
 #include "strata/ds41/kernels/k12_exl3_moe_prefill.hpp"
 
 #include <numeric>
+#include <stdexcept>
 
 using namespace ds41test;
 namespace kk = strata::ds41::kernels;
@@ -217,11 +218,58 @@ void mixed_k(Verdict& v, bool native_qdq = true) {
                 }, [&] { return as_doubles(got.down()); }, [&] { poison_dev(got); });
 }
 
+void grouped_k(Verdict& v,bool native_qdq,int T,int n_exp=6) {
+    Experts ex(n_exp,true);
+    for(auto& expert:ex.host) expert.native_qdq=native_qdq;
+    // Reverse descriptor slots to exercise the residency mapping.
+    std::reverse(ex.host.begin(),ex.host.end());
+    Dev<kk::Exl3Expert> experts(ex.host);
+    std::vector<int32_t> mapping(n_exp);std::iota(mapping.rbegin(),mapping.rend(),0);Dev<int32_t> residency(mapping);
+    const Chunk c=make_chunk(T,n_exp,n_exp>6?1.:0.,713,{0,T-1});
+    const Run r(c,3,713);
+    Dev<int32_t> ids(c.sel),active(std::vector<int32_t>{0});Dev<float> weights(c.wt);
+    const auto init=rand_f32(size_t(T)*H,.5f,714);
+    Dev<float> want(init),got(init);
+    Dev<uint8_t> old_ws(r.ws_bytes);
+    // Baseline descriptors indexed by expert id, without the reverse mapping.
+    std::reverse(ex.host.begin(),ex.host.end());Dev<kk::Exl3Expert> ordered(ex.host);
+    for(int i=0;i<n_exp/3;++i)
+        kk::exl3_moe_prefill(r.x.p,r.tok.p,r.w.p,r.offs[i].data(),3,ordered.p+i*3,want.p,old_ws.p,r.ws_bytes,0);
+    const size_t bytes=kk::exl3_moe_grouped_workspace_bytes(T,TOPK,n_exp);Dev<uint8_t> ws(bytes);
+    auto enqueue=[&](cudaStream_t st) {
+        kk::exl3_moe_prefill_grouped(r.x.p,ids.p,weights.p,T,TOPK,experts.p,residency.p,n_exp,got.p,ws.p,bytes,active.p,st);
+    };
+    enqueue(0);ck(cudaDeviceSynchronize(),"grouped prefill");
+    const auto result=got.down();const double err=delta_err(result,want.down(),init);
+    std::printf("grouped K1..K6 T=%d experts=%d native_qdq=%d rel_l2=%.9g workspace=%.1f MiB\n",T,n_exp,native_qdq,err,bytes/1048576.);
+    v.check(std::isfinite(err) && err<1e-2,"grouped K: relative L2 above 1e-2 against K12");
+    int active_expected=0;for(int e=0;e<n_exp;++e) active_expected+=c.start[e+1]>c.start[e];
+    v.check(active.down()[0]==active_expected,"grouped K: active group count");
+    bool idle_same=true;for(int t:{0,T-1}) for(int d=0;d<H;++d) idle_same &= result[size_t(t)*H+d]==init[size_t(t)*H+d];
+    v.check(idle_same,"grouped K: idle row changed");
+    graph_check(v,"grouped K graph",
+        [&](cudaStream_t st) { ck(cudaMemsetAsync(got.p,0,got.n*sizeof(float),st),"grouped reset");enqueue(st); },
+        [&] { return as_doubles(got.down()); },[&] { poison_dev(got);poison_dev(ws); });
+    if(T==129) {
+        const double grouped_us=median_us([&] { enqueue(0); },5);
+        const double old_us=median_us([&] {
+            for(int i=0;i<2;++i) kk::exl3_moe_prefill(r.x.p,r.tok.p,r.w.p,r.offs[i].data(),3,ordered.p+i*3,want.p,old_ws.p,r.ws_bytes,0);
+        },5);
+        std::printf("grouped synthetic T=%d K12_us=%.1f grouped_us=%.1f\n",T,old_us,grouped_us);
+    }
+    bool rejected=false;
+    try { kk::exl3_moe_prefill_grouped(r.x.p,ids.p,weights.p,T,TOPK,experts.p,residency.p,n_exp,got.p,ws.p,bytes-1,nullptr,0); }
+    catch(const std::invalid_argument&) { rejected=true; }
+    v.check(rejected,"grouped K: short workspace accepted");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     require_gpu();
     Verdict v;
+    for(int T:{1,37,129}) { grouped_k(v,true,T);grouped_k(v,false,T); }
+    grouped_k(v,false,1024,12);
     mixed_k(v);
     mixed_k(v, false);
     if (argc == 2 && std::string(argv[1]) == "--component-only") return v.finish();
