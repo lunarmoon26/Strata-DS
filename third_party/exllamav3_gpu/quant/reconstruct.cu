@@ -12,7 +12,10 @@ void reconstruct_tile
     half* __restrict__ g_unpacked,
     const uint16_t* __restrict__ g_packed,
     int packed_blocks_n,
-    int packed_n_offset
+    int packed_n_offset,
+    int logical_x = -1,
+    int logical_y = -1,
+    int logical_tiles_n = -1
 )
 {
     constexpr int packed_size = 16 * K + (HALF ? 8 : 0);  // in uint16s
@@ -20,9 +23,12 @@ void reconstruct_tile
     int t = threadIdx.x;
     int lane_id = t % 32;
     int warp_id = t / 32;
-    int k = blockIdx.y;
-    int n = blockIdx.x * 8;
-    int tiles_n = gridDim.x;
+    // Optional logical coordinates let the opt-in K12 wave fuse the three
+    // differently shaped projections into one launch. Existing calls retain
+    // exactly their physical grid coordinates and row-major layout.
+    int k = logical_y < 0 ? blockIdx.y : logical_y;
+    int n = (logical_x < 0 ? blockIdx.x : logical_x) * 8;
+    int tiles_n = logical_tiles_n < 0 ? gridDim.x : logical_tiles_n;
     int out_blocks_n = tiles_n * 8;
 
     // Load packed 16*128 tile
@@ -122,7 +128,9 @@ void reconstruct_mul1_job(half* unpacked, const ReconstructJob* job, int blocks_
         case 4: reconstruct_tile<4, 2, false>(unpacked, packed, blocks_n, 0); break;
         case 5: reconstruct_tile<5, 2, false>(unpacked, packed, blocks_n, 0); break;
         case 6: reconstruct_tile<6, 2, false>(unpacked, packed, blocks_n, 0); break;
-        default: assert(false && "K12: expected integer K1..K6");
+        case 7: reconstruct_tile<7, 2, false>(unpacked, packed, blocks_n, 0); break;
+        case 8: reconstruct_tile<8, 2, false>(unpacked, packed, blocks_n, 0); break;
+        default: assert(false && "K12: expected integer K1..K8");
     }
 }
 

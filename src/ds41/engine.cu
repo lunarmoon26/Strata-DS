@@ -16,6 +16,7 @@
 #include "strata/ds41/bounded_upload.hpp"
 #include "strata/ds41/engram_rows.hpp"
 #include "strata/ds41/expert_prefetch.hpp"
+#include "strata/ds41/expert_rate_hint.hpp"
 #include "strata/ds41/expert_stream.hpp"
 #include "strata/ds41/host_experts.hpp"
 #include "strata/ds41/lookahead.hpp"
@@ -32,6 +33,7 @@
 #include "strata/ds41/ops.hpp"
 #include "strata/ds41/prefill_ops.hpp"
 #include "strata/ds41/vram_experts.hpp"
+#include "strata/ds41/compat_linear.hpp"
 #include "strata/ds41/wo_a_fp8.hpp"
 #include "strata/ds41/exl3_linear.hpp"
 #include "strata/ds41/tensor_parallel.hpp"
@@ -49,6 +51,7 @@
 #include <map>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -154,6 +157,7 @@ struct Engine::Impl {
     std::unique_ptr<StageTransfer> handoff;
     bool partitioned() const { return stage.begin != 0 || stage.end != kLayers; }
     bool resident_backend() const { return partitioned() || opt.tensor_parallel; }
+    bool experimental_29() const { return pack.experimental_29(); }
     std::shared_ptr<TensorParallel> tensor;
     int tensor_rank = -1;
     Impl* tensor_cache_source = nullptr;  // read-only peer alias; one writer owns append-only KV/index rows
@@ -167,6 +171,9 @@ struct Engine::Impl {
     struct Layer {
         Fp8 wq_a, wq_b, wkv, wo_b, sh_w1, sh_w2, sh_w3, idx_wq_b, eng_wkv;
         Fp8 wo_a8{};   // wo_a as FP8 with block scales (packs from 2026-10-06); wo_a below is then null
+        Fp8 c_wkv_exl3{}, c_wgate_exl3{}, idx_wk_exl3{};
+        const half *gate_f16 = nullptr, *idx_wp_f16 = nullptr;
+        const float *eng_qw_f32 = nullptr, *eng_kw_f32 = nullptr;
         std::array<kernels::Exl3Proj, kOGroups> wo_a_exl3{};
         const bf16 *q_norm, *kv_norm, *wo_a, *attn_norm, *ffn_norm, *gate_w;
         const float *sink, *gate_bias, *hc_attn_fn, *hc_attn_base, *hc_attn_scale, *hc_ffn_fn, *hc_ffn_base,
@@ -189,6 +196,7 @@ struct Engine::Impl {
     void *dense_ws = nullptr, *dense_sh_ws = nullptr, *dense_kv_ws = nullptr, *dense_eng_ws = nullptr;
     void* dense_rows_ws = nullptr;
     size_t dense_rows_bytes = 0;
+    float* native_router_scores = nullptr;
     bf16* incoming_comp = nullptr;  // mirror of source layer 14 for split at 18
 
     // rope tables on the device: [max_seq][64] floats
@@ -224,6 +232,33 @@ struct Engine::Impl {
     std::atomic<double> worker_wake_at{0}, worker_end_at{0}, worker_wait{0}, worker_first_wait{0}, worker_admit{0};
     std::atomic<int> worker_misses{0}; // routed uses outside VRAM (CPU plus zero-copy)
     std::unique_ptr<VramExperts> vram;  // the VRAM tier (null: none)
+    bool resident_fastpath_ = false;   // opt-in 2.9: device-only routing for fully static layers
+    bool static_graphs_ = false, static_warmed_ = false;
+    int static_prefix_end_ = 0;
+    struct StaticGraph { cudaGraphExec_t exec; const bf16* comp; const bf16* index; };
+    std::map<uint64_t, StaticGraph> static_graphs;
+    int static_captures_ = 0, static_replays_ = 0;
+    int static_eager_steps_ = 0;
+    bool packed_prefill_ = false;      // opt-in 2.9: ordered packed expert waves
+    int prefill_batch_groups_ = 0;    // opt-in exact reconstructed expert waves
+    bool prefill_graphs_ = false;
+    std::unique_ptr<kernels::Exl3PrefillGraphs> prefill_expert_graphs;
+    bool experimental_verify_ = false;
+    bool cached_rows_ = false;
+    bool async_cached_rows_ = false;
+    bool verify_layer_graphs_ = false;
+    bool verify_bulk_handoff_ = false;
+    bool batch_projections_ = false;
+    bool expert_rate_kernel_ = false;
+    // Per-layer/-stage EXL3 integer rate when every expert of that layer uses one
+    // codebook-2 rate for w1/w3/w2; 0 keeps the generic mixed-rate kernel.
+    std::vector<int> rate_hints_, mtp_rate_hints_;
+    float draft_cumulative_ = 0;
+    bool prefill_cache_ = false;
+    int verify_rows_ = kVerifyMaxTokens;
+    bool experimental_dspark_ = false;
+    bool draft_bulk_embedding_ = false;
+    bf16* draft_embedding_rows_ = nullptr;
     std::unique_ptr<HostExperts> host;  // the RAM tier (null: none); the rest is read from the mapped file
     std::atomic<int> worker_ram{0}, worker_file{0}, worker_ssd{0};   // CPU experts of the step by tier
     std::atomic<bool> admit_warned{false};
@@ -357,6 +392,7 @@ struct Engine::Impl {
     struct Dspark;
     std::shared_ptr<Dspark> ds;
     void dspark_init();
+    void release_decode_scratch();
     void dspark_vram_update();
     /// DSpark's VRAM set by default (DS41_DSPARK_VRAM_MB): see dspark.cu
     static constexpr size_t kDsparkVramMb = 0;   // laptop, agent, 3 drafts: 0 / 768 / 1536 / 3072 MB took 47.4 / 49.8 / 53.2 / 56.3 ms per token
@@ -406,9 +442,12 @@ struct Engine::Impl {
                 __atomic_store_n(eng_flag + li * kEngFlagStride, ~0u, __ATOMIC_RELEASE);
         // the lookahead calls into both tiers, and the VRAM tier's copy thread writes into RAM slots: stop them first
         lookahead.reset();
+        prefill_expert_graphs.reset(); // bindings precede VRAM descriptor/ring teardown
+        estream.reset(); // frozen cache-source callbacks cannot outlive the tier
         vram.reset();
         host.reset();
         for (auto& [k, e] : graphs) cudaGraphExecDestroy(e);
+        for (auto& [k, g] : static_graphs) cudaGraphExecDestroy(g.exec);
         for (auto& [k, e] : batch_graphs) cudaGraphExecDestroy(e);
         if (st) cudaStreamSynchronize(st);
         prefill_end_quiet();
@@ -560,12 +599,175 @@ struct Engine::Impl {
     }
     const float* f32(const std::string& name) {
         const auto& t = pack.dense(name);
+        if (experimental_29() && t.dtype == DType::F16) {
+            float* converted = dalloc_own<float>(t.bytes / 2);
+            fp16_weights_to_float(static_cast<const half*>(t.device), converted, int(t.bytes / 2));
+            ck(cudaDeviceSynchronize(), "native FP16 bias conversion");
+            return converted;
+        }
         if (t.dtype != DType::F32) throw std::runtime_error(name + " is not F32");
         return (const float*) t.device;
     }
 
     void init() {
         DeviceScope scope(stage.device);
+        const char* profile = std::getenv("DS41_EXPERIMENTAL_PROFILE");
+        const bool requested_29 = profile && std::strcmp(profile, "libertaidai-29") == 0;
+        const size_t decode_cache_bytes = experimental_decode_cache_bytes(std::getenv("DS41_EXPERIMENTAL_DECODE_CACHE_MIB"));
+        const size_t ram_cache_bytes = experimental_ram_cache_bytes(std::getenv("DS41_EXPERIMENTAL_RAM_CACHE_MIB"));
+        const size_t stage_ram_cache_bytes = experimental_ram_cache_stage_bytes(std::getenv("DS41_EXPERIMENTAL_RAM_CACHE_SPLIT"),
+            ram_cache_bytes, tensor_rank >= 0 ? tensor_rank : stage.begin == 0 ? 0 : 1);
+        if (ram_cache_bytes && !experimental_29())
+            throw std::invalid_argument("DS41_EXPERIMENTAL_RAM_CACHE_MIB requires the experimental 2.9 profile");
+        const char* resident_fastpath = std::getenv("DS41_EXPERIMENTAL_RESIDENT_FASTPATH");
+        if (resident_fastpath && (std::strcmp(resident_fastpath, "0") && std::strcmp(resident_fastpath, "1")))
+            throw std::invalid_argument("DS41_EXPERIMENTAL_RESIDENT_FASTPATH must be 0 or 1");
+        const bool fast_resident = resident_fastpath && !std::strcmp(resident_fastpath, "1");
+        if (fast_resident && !experimental_29())
+            throw std::invalid_argument("DS41_EXPERIMENTAL_RESIDENT_FASTPATH requires experimental 2.9");
+        const char* static_graphs = std::getenv("DS41_EXPERIMENTAL_STATIC_GRAPHS");
+        if (static_graphs && std::strcmp(static_graphs,"0") && std::strcmp(static_graphs,"1"))
+            throw std::invalid_argument("DS41_EXPERIMENTAL_STATIC_GRAPHS must be 0 or 1");
+        static_graphs_ = static_graphs && !std::strcmp(static_graphs,"1");
+        if (static_graphs_ && (!experimental_29() || tensor || !fast_resident))
+            throw std::invalid_argument("static-prefix graphs require experimental 2.9 layer split and resident fastpath");
+        const char* packed_prefill = std::getenv("DS41_EXPERIMENTAL_PACKED_PREFILL");
+        if (packed_prefill && std::strcmp(packed_prefill, "0") && std::strcmp(packed_prefill, "1"))
+            throw std::invalid_argument("DS41_EXPERIMENTAL_PACKED_PREFILL must be 0 or 1");
+        packed_prefill_ = packed_prefill && !std::strcmp(packed_prefill, "1");
+        if (packed_prefill_ && (!experimental_29() || tensor))
+            throw std::invalid_argument("DS41_EXPERIMENTAL_PACKED_PREFILL requires experimental 2.9 layer split");
+        if(const char* batch_groups=std::getenv("DS41_EXPERIMENTAL_PREFILL_BATCH_GROUPS")) {
+            const char* end=batch_groups+std::strlen(batch_groups);
+            const auto result=std::from_chars(batch_groups,end,prefill_batch_groups_);
+            if(result.ec!=std::errc{} || result.ptr!=end || prefill_batch_groups_<0 || prefill_batch_groups_>16)
+                throw std::invalid_argument("DS41_EXPERIMENTAL_PREFILL_BATCH_GROUPS must be an integer in 0..16");
+        }
+        if(prefill_batch_groups_ && (!experimental_29() || tensor || packed_prefill_))
+            throw std::invalid_argument("batched prefill requires experimental 2.9 layer split without packed prefill");
+        if(const char* graphs=std::getenv("DS41_EXPERIMENTAL_PREFILL_GRAPHS")) {
+            if(std::strcmp(graphs,"0") && std::strcmp(graphs,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_PREFILL_GRAPHS must be 0 or 1");
+            prefill_graphs_=!std::strcmp(graphs,"1");
+        }
+        if(prefill_graphs_ && (!experimental_29() || tensor || packed_prefill_ || prefill_batch_groups_))
+            throw std::invalid_argument("expert prefill graphs require experimental 2.9 layer split without packed/batched expert options");
+        if(const char* verify=std::getenv("DS41_EXPERIMENTAL_VERIFY")) {
+            if(std::strcmp(verify,"0") && std::strcmp(verify,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_VERIFY must be 0 or 1");
+            experimental_verify_=!std::strcmp(verify,"1");
+        }
+        if(experimental_verify_ && (!experimental_29() || tensor))
+            throw std::invalid_argument("experimental verification requires 2.9 layer split");
+        if(const char* cached=std::getenv("DS41_EXPERIMENTAL_CACHED_ROWS")) {
+            if(std::strcmp(cached,"0") && std::strcmp(cached,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_CACHED_ROWS must be 0 or 1");
+            cached_rows_=!std::strcmp(cached,"1");
+        }
+        if(cached_rows_ && (!experimental_29() || tensor))
+            throw std::invalid_argument("cached row batches require experimental 2.9 layer split");
+        if(const char* value=std::getenv("DS41_EXPERIMENTAL_ASYNC_CACHED_ROUTES")) {
+            if(std::strcmp(value,"0") && std::strcmp(value,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_ASYNC_CACHED_ROUTES must be 0 or 1");
+            async_cached_rows_=!std::strcmp(value,"1");
+        }
+        if(async_cached_rows_ && (!experimental_29() || tensor || !experimental_verify_ || !cached_rows_))
+            throw std::invalid_argument("async cached routes require experimental 2.9 layer split, verification and cached rows");
+        if(const char* value=std::getenv("DS41_EXPERIMENTAL_VERIFY_LAYER_GRAPHS")) {
+            if(std::strcmp(value,"0") && std::strcmp(value,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_VERIFY_LAYER_GRAPHS must be 0 or 1");
+            verify_layer_graphs_=!std::strcmp(value,"1");
+        }
+        if(verify_layer_graphs_ && (!experimental_29() || tensor || !static_graphs_))
+            throw std::invalid_argument("verifier layer graphs require experimental layer split and static graphs");
+        if(const char* value=std::getenv("DS41_EXPERIMENTAL_VERIFY_BULK_HANDOFF")) {
+            if(std::strcmp(value,"0") && std::strcmp(value,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_VERIFY_BULK_HANDOFF must be 0 or 1");
+            verify_bulk_handoff_=!std::strcmp(value,"1");
+        }
+        if(verify_bulk_handoff_ && (!experimental_29() || tensor || !experimental_verify_))
+            throw std::invalid_argument("bulk verifier handoff requires experimental 2.9 layer split and verification");
+        if(const char* value=std::getenv("DS41_EXPERIMENTAL_BATCH_PROJECTIONS")) {
+            if(std::strcmp(value,"0") && std::strcmp(value,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_BATCH_PROJECTIONS must be 0 or 1");
+            batch_projections_=!std::strcmp(value,"1");
+        }
+        if(batch_projections_ && (!experimental_29() || tensor))
+            throw std::invalid_argument("batched projections require experimental 2.9 layer split");
+        if(const char* value=std::getenv("DS41_EXPERIMENTAL_EXPERT_RATE_KERNEL")) {
+            if(std::strcmp(value,"0") && std::strcmp(value,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_EXPERT_RATE_KERNEL must be 0 or 1");
+            expert_rate_kernel_=!std::strcmp(value,"1");
+        }
+        if(expert_rate_kernel_ && (!experimental_29() || tensor))
+            throw std::invalid_argument("per-rate expert dispatch requires experimental 2.9 layer split");
+        // Only opt-in runs scan the index. A zero hint preserves mixed-rate dispatch.
+        rate_hints_.assign(kLayers, 0);
+        mtp_rate_hints_.assign(size_t(pack.mtp_stages()),0);
+        if(expert_rate_kernel_) {
+            for(int l=0;l<kLayers;++l)
+                rate_hints_[l] = uniform_expert_integer_rate(pack.n_experts(),
+                    [&](int e) -> const ExpertSlot& { return pack.expert(l,e); });
+            for(int s=0;s<pack.mtp_stages();++s)
+                mtp_rate_hints_[size_t(s)] = uniform_expert_integer_rate(pack.mtp_experts(),
+                    [&](int e) -> const ExpertSlot& { return pack.mtp_expert(s,e); });
+            const auto eligible = [](const std::vector<int>& hints) {
+                return std::count_if(hints.begin(),hints.end(),[](int bits) { return bits != 0; });
+            };
+            std::fprintf(stderr,"ds41 per-rate expert hints: backbone=%zu/%zu mtp=%zu/%zu\n",
+                size_t(eligible(rate_hints_)),rate_hints_.size(),
+                size_t(eligible(mtp_rate_hints_)),mtp_rate_hints_.size());
+        }
+        if(const char* value=std::getenv("DS41_EXPERIMENTAL_DRAFT_CUM")) {
+            char* end=nullptr;draft_cumulative_=std::strtof(value,&end);
+            if(end==value || *end || !std::isfinite(draft_cumulative_) || draft_cumulative_<0 || draft_cumulative_>1)
+                throw std::invalid_argument("DS41_EXPERIMENTAL_DRAFT_CUM must be in 0..1");
+        }
+        if(draft_cumulative_ && (!experimental_29() || tensor))
+            throw std::invalid_argument("draft confidence trimming requires experimental 2.9 layer split");
+        if(const char* cache=std::getenv("DS41_EXPERIMENTAL_PREFILL_CACHE")) {
+            if(std::strcmp(cache,"0") && std::strcmp(cache,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_PREFILL_CACHE must be 0 or 1");
+            prefill_cache_=!std::strcmp(cache,"1");
+        }
+        if(prefill_cache_ && (!experimental_29() || tensor || packed_prefill_))
+            throw std::invalid_argument("prefill cache reuse requires reconstructed experimental 2.9 layer split");
+        if(const char* rows=std::getenv("DS41_EXPERIMENTAL_VERIFY_ROWS")) {
+            const char* end=rows+std::strlen(rows);
+            const auto parsed=std::from_chars(rows,end,verify_rows_);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=end || verify_rows_<kVerifyMaxTokens || verify_rows_>kVerifyMaxResidentTokens)
+                throw std::invalid_argument("DS41_EXPERIMENTAL_VERIFY_ROWS must be 4..6");
+        }
+        if(verify_rows_>kVerifyMaxTokens && (!experimental_verify_ || !experimental_29() || tensor || opt.batch_slots))
+            throw std::invalid_argument("wider verification requires opt-in experimental 2.9 layer split without batch slots");
+        if(const char* dspark=std::getenv("DS41_EXPERIMENTAL_DSPARK")) {
+            if(std::strcmp(dspark,"0") && std::strcmp(dspark,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_DSPARK must be 0 or 1");
+            experimental_dspark_=!std::strcmp(dspark,"1");
+        }
+        if(experimental_dspark_ && (!experimental_29() || tensor || !experimental_verify_))
+            throw std::invalid_argument("experimental DSpark requires 2.9 layer split and experimental verification");
+        if(const char* value=std::getenv("DS41_EXPERIMENTAL_DRAFT_BULK_EMBEDDING")) {
+            if(std::strcmp(value,"0") && std::strcmp(value,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_DRAFT_BULK_EMBEDDING must be 0 or 1");
+            draft_bulk_embedding_=!std::strcmp(value,"1");
+        }
+        if(draft_bulk_embedding_ && (!experimental_29() || tensor || !experimental_dspark_ || !opt.dspark))
+            throw std::invalid_argument("bulk draft embedding requires experimental 2.9 layer split and DSpark");
+        if(draft_bulk_embedding_ && stage.begin==0)
+            draft_embedding_rows_=dalloc_own<bf16>(size_t(dspark::kBlock)*kHc*kDim);
+        if (decode_cache_bytes && !experimental_29())
+            throw std::invalid_argument("DS41_EXPERIMENTAL_DECODE_CACHE_MIB requires the experimental 2.9 profile");
+        if ((profile && !requested_29) || requested_29 != experimental_29())
+            throw std::invalid_argument("experimental pack and DS41_EXPERIMENTAL_PROFILE=libertaidai-29 must agree");
+        if (experimental_29()) {
+            const char* graph = std::getenv("DS41_GRAPH");
+            const char* grouped = std::getenv("DS41_PF_GROUPED");
+            if (!resident_backend() || (opt.dspark && !experimental_dspark_) || opt.batch_slots || !graph || std::strcmp(graph, "0") ||
+                (grouped && std::strcmp(grouped, "0")))
+                throw std::invalid_argument("experimental 2.9 requires two devices, DS41_GRAPH=0, no grouped prefill/batch slots; DSpark needs its explicit experimental gates");
+            native_router_scores = dalloc_own<float>(kExperts);
+        }
         if (resident_backend() && (!pack.has_exl3_dense() || pack.has_mcg()))
             throw std::invalid_argument("ds41: resident serving targets the published sudoingx 1017 full mul1 EXL3 profile only");
         if (pack.has_mcg() && !resident_backend())
@@ -624,15 +826,24 @@ struct Engine::Impl {
             y.hc_ffn_fn = f32(p + "hc_ffn_fn");
             y.hc_ffn_base = f32(p + "hc_ffn_base");
             y.hc_ffn_scale = f32(p + "hc_ffn_scale");
-            y.gate_w = bf(p + "ffn.gate.weight");
+            y.gate_w = nullptr;
+            if (experimental_29()) {
+                const auto& gate = pack.dense(p + "ffn.gate.weight");
+                if (gate.dtype != DType::F16) throw std::runtime_error("experimental router must retain FP16 weights");
+                y.gate_f16 = static_cast<const half*>(gate.device);
+            } else y.gate_w = bf(p + "ffn.gate.weight");
             y.gate_bias = f32(p + "ffn.gate.bias");
             y.sh_w1 = fp8(p + "ffn.shared_experts.w1");
             y.sh_w2 = fp8(p + "ffn.shared_experts.w2");
             y.sh_w3 = fp8(p + "ffn.shared_experts.w3");
             if (is_kv_source(l)) {
-                y.c_wkv = bf(p + "attn.compressor.wkv.weight");
+                if (experimental_29()) y.c_wkv_exl3 = fp8(p + "attn.compressor.wkv");
+                else y.c_wkv = bf(p + "attn.compressor.wkv.weight");
                 y.c_norm = bf(p + "attn.compressor.norm.weight");
-                if (y.ratio > 1) y.c_wgate = bf(p + "attn.compressor.wgate.weight");
+                if (y.ratio > 1) {
+                    if (experimental_29()) y.c_wgate_exl3 = fp8(p + "attn.compressor.wgate");
+                    else y.c_wgate = bf(p + "attn.compressor.wgate.weight");
+                }
                 if(tensor_cache_source) {
                     y.comp=tensor_cache_source->L[l].comp;
                     y.idx_keys=tensor_cache_source->L[l].idx_keys;
@@ -644,17 +855,27 @@ struct Engine::Impl {
                     y.kv_state = dalloc_own<float>((size_t) y.ratio * kHeadDim);
                     y.score_state = dalloc_own<float>((size_t) y.ratio * kHeadDim);
                 }
-                y.idx_wk = bf(p + "attn.indexer.wk.weight");
+                if (experimental_29()) y.idx_wk_exl3 = fp8(p + "attn.indexer.wk");
+                else y.idx_wk = bf(p + "attn.indexer.wk.weight");
                 y.idx_knorm = bf(p + "attn.indexer.k_norm.weight");
             }
             if (is_index_source(l)) {
                 y.idx_wq_b = fp8(p + "attn.indexer.wq_b");
-                y.idx_wp = bf(p + "attn.indexer.weights_proj.weight");
+                if (experimental_29()) {
+                    const auto& weights = pack.dense(p + "attn.indexer.weights_proj.weight");
+                    if (weights.dtype != DType::F16) throw std::runtime_error("experimental index weights must retain FP16");
+                    y.idx_wp_f16 = static_cast<const half*>(weights.device);
+                } else y.idx_wp = bf(p + "attn.indexer.weights_proj.weight");
             }
             if (is_engram_layer(l)) {
                 y.eng_wkv = fp8(p + "engram.wkv");
-                y.eng_qw = bf(p + "engram.q_weight");
-                y.eng_kw = bf(p + "engram.k_weight");
+                if (experimental_29()) {
+                    y.eng_qw_f32 = f32(p + "engram.q_weight");
+                    y.eng_kw_f32 = f32(p + "engram.k_weight");
+                } else {
+                    y.eng_qw = bf(p + "engram.q_weight");
+                    y.eng_kw = bf(p + "engram.k_weight");
+                }
             }
             y.window = dalloc_own<bf16>((size_t) kWindow * kHeadDim);
             for (const auto& dims : std::vector<std::array<int64_t, 4>>{
@@ -854,7 +1075,14 @@ struct Engine::Impl {
             ad.decay = opt.adapt_decay;
             ad.max_swaps = opt.adapt_swaps;
             vram = std::make_unique<VramExperts>(pack, opt.expert_profile, opt.vram_expert_slots,
-                                                 opt.vram_reserve_bytes, ad, stage.begin, stage.end, resident_backend(),tensor_rank);
+                                                 experimental_29() ? std::max(opt.vram_reserve_bytes, size_t((tensor ? 2ull : 12ull) << 30)) : opt.vram_reserve_bytes,
+                                                  ad, stage.begin, stage.end, resident_backend(),tensor_rank,experimental_29(),decode_cache_bytes,
+                                                  stage_ram_cache_bytes,async_cached_rows_);
+            resident_fastpath_ = fast_resident;
+            static_prefix_end_ = stage.begin;
+            while(static_prefix_end_<stage.end && vram->fully_resident_layer(static_prefix_end_)) ++static_prefix_end_;
+            if(static_graphs_) std::fprintf(stderr,"ds41 experimental static graphs: stage %d..%d resident prefix ends at %d (exclusive)\n",
+                                           stage.begin,stage.end-1,static_prefix_end_);
             std::fprintf(stderr, "ds41: %d VRAM expert slots (%.2f GiB)\n", vram->slots(),
                          vram->arena_bytes() / (double) (1ull << 30));
         }
@@ -1010,6 +1238,19 @@ struct Engine::Impl {
         } else for(int r=0;r<rows;++r) ops::embed_device(embed,params+r*param_stride,output+size_t(r)*kHc*kDim,stream);
     }
     void fp8_linear(const bf16* x, const Fp8& w, bf16* y) { fp8_linear_on(x, w, y, act, st); }
+    void small_linear(const bf16* x, const bf16* native, const Fp8& quant, int k, int n,
+                       bf16* y, float* yf, cudaStream_t stream) {
+        if (quant.exl3.trellis)
+            exl3_linear(x, quant.exl3, y, yf, stream == st_kv ? dense_kv_ws : dense_ws,
+                        dense_workspace_bytes, stream, yf != nullptr);
+        else ops::bf16_linear(x, nullptr, native, k, n, y, yf, stream);
+    }
+    void small_rows(const bf16* x, const bf16* native, const Fp8& quant, int rows, int k, int n,
+                     bf16* y, float* yf, float* temp) {
+        if (quant.exl3.trellis)
+            exl3_linear_rows(x, quant.exl3, y, rows, k, n, dense_rows_ws, dense_rows_bytes, 0, yf);
+        else prefill::bf16_gemm(x, native, rows, k, n, y, yf, temp);
+    }
     void fp8_linear_on(const bf16* x, const Fp8& w, bf16* y, float* scratch, cudaStream_t s) {
         if (w.exl3.trellis) {
             void* ws = s == st_sh ? dense_sh_ws : s == st_kv ? dense_kv_ws : s == st_eng ? dense_eng_ws : dense_ws;
@@ -1320,7 +1561,9 @@ struct Engine::Impl {
     /// Engram.forward for layer l (engram layer li): wait for its eng_kv, apply it to h.
     void engram(int l, int li) {
         ck(cudaStreamWaitEvent(st, eng_join[li], 0), "engram join wait");
-        ops::engram_apply(h, eng_kv + (size_t) li * (kHc + 1) * kDim, L[l].eng_qw, L[l].eng_kw, kNormEps, 1, st);
+        if (experimental_29())
+            ops::engram_apply_f32(h, eng_kv + (size_t) li * (kHc + 1) * kDim, L[l].eng_qw_f32, L[l].eng_kw_f32, kNormEps, 1, st);
+        else ops::engram_apply(h, eng_kv + (size_t) li * (kHc + 1) * kDim, L[l].eng_qw, L[l].eng_kw, kNormEps, 1, st);
     }
 
     // ------------------------------------------------------------------------------------- indexer
@@ -1331,7 +1574,7 @@ struct Engine::Impl {
         const int ratio = y.ratio;
         const int64_t tcap = ratio == 1 ? tcap1 : tcap2;
         if (is_kv_source(l) && have_latent) {
-            ops::bf16_linear(latent, nullptr, y.idx_wk, kHeadDim, kIndexDim, ik, nullptr, st);
+            small_linear(latent, y.idx_wk, y.idx_wk_exl3, kHeadDim, kIndexDim, ik, nullptr, st);
             ops::rmsnorm(ik, y.idx_knorm, ik, kIndexDim, kNormEps, 1, st);
             ops::rope_device(ik, 1, kIndexDim, rope_yarn, dp + 1, 1 - ratio, false, st);
             ops::fp4_quant_inplace(ik, kIndexDim, 32, false, st);
@@ -1342,7 +1585,8 @@ struct Engine::Impl {
         fp8_linear(qr, y.idx_wq_b, iq);
         ops::rope_device(iq, kIndexHeads, kIndexDim, rope_yarn, dp + 1, 0, false, st);
         ops::fp4_quant_inplace(iq, kIndexHeads * kIndexDim, 32, false, st);
-        ops::bf16_linear(xa, nullptr, y.idx_wp, kDim, kIndexHeads, iw_raw, nullptr, st);
+        if (y.idx_wp_f16) fp16_weight_linear(xa, y.idx_wp_f16, 1, kDim, kIndexHeads, iw_raw, nullptr, st);
+        else ops::bf16_linear(xa, nullptr, y.idx_wp, kDim, kIndexHeads, iw_raw, nullptr, st);
         ops::scale_bf16(iw_raw, (float) (std::pow(kIndexDim, -0.5) * std::pow(kIndexHeads, -0.5)), iw, kIndexHeads, st);
         // the candidate layer selects blocks from its own unmasked scores; the layers after it mask with them.
         // t = (pos + 1) / ratio on the device: no work while it is 0 (the first incomplete group)
@@ -1371,12 +1615,12 @@ struct Engine::Impl {
         if (y.ratio > 0 && is_kv_source(l)) {
             const int ratio = y.ratio;
             if (ratio == 1) {
-                ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, latent, nullptr, st_kv);
+                small_linear(xa, y.c_wkv, y.c_wkv_exl3, kDim, kHeadDim, latent, nullptr, st_kv);
                 ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st_kv);
                 have_latent = true;
             } else {   // ratio 2: slot pos % 2; a group completes at odd positions (one graph per parity)
-                ops::bf16_linear(xa, nullptr, y.c_wkv, kDim, kHeadDim, nullptr, y.kv_state + parity * kHeadDim, st_kv);
-                ops::bf16_linear(xa, nullptr, y.c_wgate, kDim, kHeadDim, nullptr, y.score_state + parity * kHeadDim,
+                small_linear(xa, y.c_wkv, y.c_wkv_exl3, kDim, kHeadDim, nullptr, y.kv_state + parity * kHeadDim, st_kv);
+                small_linear(xa, y.c_wgate, y.c_wgate_exl3, kDim, kHeadDim, nullptr, y.score_state + parity * kHeadDim,
                                  st_kv);
                 if (parity == ratio - 1) {
                     ops::compress_pool(y.kv_state, y.score_state, ratio, latent, 1, st_kv);
@@ -1436,7 +1680,10 @@ struct Engine::Impl {
         auto& y = L[l];
         int32_t* ids = routes_dev + l * kTopK;
         float* w = weights_dev + l * kTopK;
-        kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, st);
+        if (y.gate_f16) {
+            fp16_weight_linear(xf, y.gate_f16, 1, kDim, kExperts, nullptr, native_router_scores, st);
+            prefill::route_rows(native_router_scores, y.gate_bias, 1, ids, w, st);
+        } else kernels::router_topk(xf, 1, y.gate_w, y.gate_bias, ids, w, st);
         // K10 computes VRAM hits and a quota of RAM misses (staged or direct) while the CPU computes the rest.
         if (pack.has_exl3_dense()) exl3_input_half(xf, x_half_dev, kDim, st);
         else ops::to_half_fp8q(xf, x_half_dev, kDim, st);
@@ -1444,7 +1691,10 @@ struct Engine::Impl {
         const auto* ram = host && host->experts_dev() ? host->experts_dev() + (size_t) l * kExperts : nullptr;
         // prefetch: layer l's guesses were planned and copied during layer l - 1 (none for layer 0)
         const bool pf = prefetch && ram && zc_blobs;
-        if (resident_backend()) {
+        if (experimental_29()) {
+            if(!(cached_rows_ && !vram->fully_resident_layer(l) && vram->try_cached_rows(l,ids,1,kTopK,gpu_sel,st)))
+                vram->prepare_decode(l, ids, kTopK, gpu_sel, st, resident_fastpath_);
+        } else if (resident_backend()) {
             ops::resident_routes(ids, vram->res_dev() + (size_t) l * kExperts, gpu_sel, st);
         } else db->publish(x_half_dev, ids, w, 1, tier ? vram->res_dev() + (size_t) l * kExperts : nullptr, gpu_sel,
                     (uint32_t) (l + 1), st, tier ? vram->experts_dev() : nullptr, ram,
@@ -1481,12 +1731,14 @@ struct Engine::Impl {
         } else if (!staged && (tier || ram))
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK,
                                       resident_backend() ? vram->experts_dev() : db->gpu_experts(), routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st,
+                                     rate_hints_[l]);
         // One K10 call preserves route reduction order.
         if (staged) {
             zc_stage->join(st);
             kernels::exl3_moe_decode((const __half*) x_half_dev, 1, gpu_sel, w, kTopK, db->gpu_experts(), routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st,
+                                     rate_hints_[l]);
         }
         if (!resident_backend()) db->wait_add(routed, 1, (uint32_t) (l + 1), st);
         // layer l + 1's guesses are read by its publish, and the next layer overwrites xf, which they read
@@ -1557,7 +1809,9 @@ struct Engine::Impl {
     /// carved from lent VRAM tier slots or cudaMalloc; the ring separately
     struct Prefill {
         int cap = 0, sub = 0;
-        bool grouped = false;
+        bool grouped = false, batched_hc = false, packed_waves = false;
+        int batch_groups = 0;
+        bool expert_graphs = false;
         int32_t* active_groups = nullptr;
         uint8_t* lent = nullptr;                 // lent VRAM tier slots (scratch, ring or both)
         uint8_t* own_scratch = nullptr;          // or cudaMalloc
@@ -1570,6 +1824,7 @@ struct Engine::Impl {
         float *pre_mix, *ffn_pre, *ffn_post, *ffn_comb, *routed, *wts, *rows_w, *nll_out;
         uint16_t* x_half;
         int32_t *tok, *ids, *topk, *rows_tok, *targets;
+        int32_t *wave_ids = nullptr, *wave_map = nullptr;
         uint8_t* cand;
         // per sub-batch
         bf16 *xa, *qr, *q, *o, *oa, *attn_out, *kvv, *iq, *iw_raw, *iw, *g, *u, *sh_h, *sh_out, *ffn_out, *eng_vals,
@@ -1586,6 +1841,7 @@ struct Engine::Impl {
         uint8_t* base = nullptr;
         int cap = 0;
         int32_t *tok, *ids, *rows_tok, *targets;
+        int32_t* wave_map = nullptr;
         float *wts, *rows_w, *pre, *nll;
         kernels::Exl3Expert* desc;
         uint8_t* eng;   // per engram table: cap * kEngRows * 256 weight bytes, then cap * kEngRows * 8 scale bytes
@@ -1630,6 +1886,10 @@ struct Engine::Impl {
         p.nll_out = carve<float>(base, u, c);
         p.tok = carve<int32_t>(base, u, c);
         p.ids = carve<int32_t>(base, u, c * kTopK);
+        if (p.packed_waves) {
+            p.wave_ids = carve<int32_t>(base, u, c * kTopK);
+            p.wave_map = carve<int32_t>(base, u, kExperts);
+        }
         p.topk = carve<int32_t>(base, u, c * kIndexTopK);
         p.rows_tok = carve<int32_t>(base, u, c * kTopK);
         p.targets = carve<int32_t>(base, u, c);
@@ -1670,13 +1930,16 @@ struct Engine::Impl {
         p.eng_dev = carve<uint8_t>(base, u, std::max<size_t>((size_t) n_eng * b * kEngRows * (256 + 8), 1));
         p.desc = carve<kernels::Exl3Expert>(base, u, 2 * kExperts);
         p.k2_ws = carve<uint8_t>(base, u, b * (size_t) max_k * 4);
-        p.k12_bytes = p.grouped ? kernels::exl3_moe_grouped_workspace_bytes(cap, kTopK, kExperts)
+        p.k12_bytes = p.batch_groups ? kernels::exl3_moe_batched_workspace_bytes(cap*kTopK,p.batch_groups)
+                      : (p.grouped || p.packed_waves) ? kernels::exl3_moe_grouped_workspace_bytes(cap, kTopK, kExperts)
                                : kernels::exl3_moe_prefill_workspace_bytes(cap * kTopK, kExperts);
+        if(p.expert_graphs) p.k12_bytes=std::max(p.k12_bytes,kernels::exl3_moe_prefill_workspace_bytes(512,1));
         p.k12_ws = carve<uint8_t>(base, u, p.k12_bytes);
         if (p.grouped) p.active_groups = carve<int32_t>(base, u, 1);
         p.k14_bytes = kernels::indexer_topk_prefill_workspace_bytes(sub, max_seq);
         p.k14_ws = carve<uint8_t>(base, u, p.k14_bytes);
-        p.k15_bytes = kernels::hc_mixes_pre_rows_workspace_bytes(sub);
+        p.k15_bytes = p.batched_hc ? kernels::hc_mixes_pre_rows_batched_workspace_bytes(sub)
+                                   : kernels::hc_mixes_pre_rows_workspace_bytes(sub);
         p.k15_ws = carve<uint8_t>(base, u, std::max<size_t>(p.k15_bytes, 1));
         return (u + 255) & ~(size_t) 255;
     }
@@ -1693,13 +1956,33 @@ struct Engine::Impl {
         pfp.n=0;
         const char* grouped = std::getenv("DS41_PF_GROUPED");
         const bool use_grouped = grouped && grouped[0] && grouped[0]!='0';
+        const char* hc = std::getenv("DS41_PF_HC_BATCHED");
+        if (hc && std::strcmp(hc, "0") && std::strcmp(hc, "1"))
+            throw std::invalid_argument("DS41_PF_HC_BATCHED must be 0 or 1");
+        const bool batched_hc = hc && hc[0] == '1';
         if (use_grouped && (!partitioned() || tensor || pack.has_mcg()))
             throw std::invalid_argument("DS41_PF_GROUPED requires resident layer-split mul1 prefill");
         if (partitioned()) {
             // Never lend resident expert slots or construct an expert stream.
             // Bounded chunk/sub-batch scratch only; keep >=512 MiB driver reserve.
+            release_decode_scratch();
             pf = Prefill{};
             pf.grouped=use_grouped;
+            pf.packed_waves=packed_prefill_;
+            pf.batch_groups=prefill_batch_groups_;
+            pf.expert_graphs=prefill_graphs_;
+            pf.batched_hc=batched_hc;
+            if (pf.packed_waves) {
+                for (int l=stage.begin;l<stage.end;++l) for(int e=0;e<kExperts;++e) {
+                    const auto& slot=pack.expert(l,e);
+                    const uint64_t tiles=uint64_t(kDim/16)*(kMoeInter/16)*2;
+                    for(int p=0;p<3;++p) {
+                        const uint64_t width=slot.comp_bytes[p*4]/tiles;
+                        if(slot.codebook[p]!=2 || slot.comp_bytes[p*4]%tiles || width%16 || width<16 || width>96)
+                            throw std::invalid_argument("packed 2.9 prefill requires aligned K1..K6 mul1 projections");
+                    }
+                }
+            }
             if (pf.grouped) {
                 // Validate descriptors once on the host, never read routes back.
                 for (int l=stage.begin;l<stage.end;++l) for (int e=0;e<kExperts;++e) {
@@ -1719,6 +2002,15 @@ struct Engine::Impl {
             for (;;) {
                 scratch = layout(pf, nullptr, cap, sub);
                 dense_bytes = exl3_rows_workspace_bytes(sub, kQLora, kHeads * kHeadDim);
+                if (experimental_29()) {
+                    for (int l = stage.begin; l < stage.end; ++l) {
+                        const auto& y = L[l];
+                        for (const Fp8* projection : {&y.wq_a, &y.wq_b, &y.wkv, &y.wo_b, &y.sh_w1, &y.sh_w2,
+                                &y.sh_w3, &y.idx_wq_b, &y.eng_wkv, &y.c_wkv_exl3, &y.c_wgate_exl3, &y.idx_wk_exl3})
+                            if (projection->exl3.trellis)
+                                dense_bytes = std::max(dense_bytes, exl3_rows_workspace_bytes(sub, projection->k, projection->n));
+                    }
+                }
                 if (scratch + dense_bytes + (512ull << 20) < free_b) break;
                 if (cap <= 16) throw std::runtime_error("resident prefill: insufficient bounded scratch VRAM");
                 cap = std::max(16, cap / 2); sub = std::min(sub, cap);
@@ -1728,13 +2020,34 @@ struct Engine::Impl {
             layout(pf, pf.own_scratch, cap, sub);
             dense_rows_bytes = dense_bytes;
             ck(cudaMalloc(&dense_rows_ws, dense_bytes), "resident EXL3 row workspace");
+            if (experimental_29()) {
+                if(prefill_cache_) {
+                    const double start=now_ms();const auto primed=vram->prime_prefill_cache();
+                    ptm->prefill_cache_prime_ms+=now_ms()-start;
+                    std::fprintf(stderr,"ds41 prefill cache prime: gpu_fills=%d ram_fills=%d payload_bytes=%llu stage=%d..%d\n",
+                        primed.gpu_fills,primed.ram_fills,(unsigned long long)primed.bytes,stage.begin,stage.end-1);
+                }
+                pf.slot_bytes = vram->max_slot_bytes();
+                pf.ring_slots = 16;
+                ck(cudaMalloc(&pf.own_ring, pf.slot_bytes * pf.ring_slots), "experimental prefill expert ring");
+                pf.ring = static_cast<uint8_t*>(pf.own_ring);
+                std::function<const uint8_t*(int,int)> ram_source;
+                if(prefill_cache_) ram_source=[tier=vram.get()](int l,int e){return tier->prefill_ram_source(l,e);};
+                estream = std::make_unique<ExpertStream>(pack, nullptr, pf.ring, pf.ring_slots, pf.slot_bytes, 2, 8, true,std::move(ram_source));
+                std::fprintf(stderr, "ds41 experimental prefill: bounded %d-slot ring, 8 host buffers, original expert bytes from SSD\n", pf.ring_slots);
+            }
             alloc_prefill_host(cap);
-            std::fprintf(stderr, "ds41 resident prefill: stage %d..%d chunk %d batch %d scratch %.3f GiB + dense %.3f GiB; no expert eviction\n",
-                         stage.begin, stage.end - 1, cap, sub, scratch / 1073741824., dense_bytes / 1073741824.);
+            std::fprintf(stderr, "ds41 resident prefill: stage %d..%d chunk %d batch %d scratch %.3f GiB + dense %.3f GiB; %s\n",
+                         stage.begin, stage.end - 1, cap, sub, scratch / 1073741824., dense_bytes / 1073741824.,
+                         experimental_29() ? "bounded expert streaming" : "no expert eviction");
             if (pf.grouped) std::fprintf(stderr,"ds41 resident prefill: grouped packed EXL3 enabled\n");
+            if (pf.packed_waves) std::fprintf(stderr,"ds41 experimental prefill: ordered packed hot/cold expert waves enabled\n");
+            if (pf.batch_groups) std::fprintf(stderr,"ds41 experimental prefill: exact reconstructed waves of %d experts enabled\n",pf.batch_groups);
+            if (pf.batched_hc) std::fprintf(stderr,"ds41 resident prefill: exact-order batched K15 enabled, %zu scratch bytes\n", pf.k15_bytes);
             return;
         }
         pf = Prefill{};
+        pf.batched_hc=batched_hc;
         // a ring slot holds any expert of the pack (upstream: MAXBLOB); the tier's slots may be smaller
         for (int l = 0; l < kLayers; ++l)
             for (int e = 0; e < kExperts; ++e) pf.slot_bytes = std::max<size_t>(pf.slot_bytes, pack.expert(l, e).bytes);
@@ -1796,6 +2109,7 @@ struct Engine::Impl {
                 const size_t c = (size_t) cap;
                 pfh.tok = carve<int32_t>(b, u, c);
                 pfh.ids = carve<int32_t>(b, u, c * kTopK);
+                if (packed_prefill_) pfh.wave_map = carve<int32_t>(b, u, kExperts);
                 pfh.rows_tok = carve<int32_t>(b, u, c * kTopK);
                 pfh.targets = carve<int32_t>(b, u, c);
                 pfh.wts = carve<float>(b, u, c * kTopK);
@@ -1849,6 +2163,7 @@ struct Engine::Impl {
         if (dense_rows_ws) cudaFree(dense_rows_ws);
         dense_rows_ws = nullptr;
         estream.reset();
+        prefill_expert_graphs.reset();
         if (pf.own_scratch) cudaFree(pf.own_scratch);
         if (pf.own_ring) cudaFree(pf.own_ring);
         pf.lent = pf.own_scratch = pf.own_ring = nullptr;
@@ -1858,8 +2173,21 @@ struct Engine::Impl {
         DeviceScope scope(stage.device);
         if (dense_rows_ws) cudaFree(dense_rows_ws);
         dense_rows_ws = nullptr;
+        if (experimental_29() && estream) {
+            const auto stats = estream->take_stats();
+            std::fprintf(stderr, "ds41 experimental prefill stream: %lld jobs, %lld RAM, %lld SSD, %.1f ms consumer wait\n",
+                         (long long)stats.jobs,(long long)stats.from_ram,(long long)stats.from_ssd,stats.consumer_wait_ms);
+        }
         estream.reset();
         ck(cudaDeviceSynchronize(), "prefill end");
+        if(prefill_expert_graphs) {
+            ptm->expert_graph_captures+=prefill_expert_graphs->captures();
+            ptm->expert_graph_replays+=prefill_expert_graphs->replays();
+            std::fprintf(stderr,"ds41 exact expert prefill graphs: captures=%llu replays=%llu eager=%llu stage=%d..%d\n",
+                (unsigned long long)prefill_expert_graphs->captures(),(unsigned long long)prefill_expert_graphs->replays(),
+                (unsigned long long)prefill_expert_graphs->eager_calls(),stage.begin,stage.end-1);
+            prefill_expert_graphs.reset();
+        }
         if (pf.own_scratch) cudaFree(pf.own_scratch);
         if (pf.own_ring) cudaFree(pf.own_ring);
         if (pf.lent && vram) vram->restore();
@@ -1880,7 +2208,10 @@ struct Engine::Impl {
     /// K7's hyper-connection mixes for T rows (task K15)
     void hc_rows(const bf16* x, int T, const float* fn, const float* scale, const float* base, const float* pre_in,
                  bf16* y, float* pre, float* post, float* comb) {
-        kernels::hc_mixes_pre_rows(x, T, fn, scale, base, pre_in, y, pre, post, comb, pf.k15_ws, pf.k15_bytes, 0);
+        if (pf.batched_hc)
+            kernels::hc_mixes_pre_rows_batched(x, T, fn, scale, base, pre_in, y, pre, post, comb, pf.k15_ws, pf.k15_bytes, 0);
+        else kernels::hc_mixes_pre_rows(x, T, fn, scale, base, pre_in, y, pre, post, comb, pf.k15_ws, pf.k15_bytes, 0);
+        if (ptm) { ++ptm->hc_calls; ptm->hc_launches += pf.batched_hc ? 2 : 2 * ((T + 7) / 8); }
     }
 
     /// The compressed entries of kv source l completed in this chunk (decode: attention(), compressor part), their
@@ -1890,7 +2221,7 @@ struct Engine::Impl {
         const int r = y.ratio;
         int G, g0;
         if (r == 1) {
-            prefill::bf16_gemm(pf.xa, y.c_wkv, T, kDim, kHeadDim, pf.latent, nullptr, pf.ftmp);
+            small_rows(pf.xa, y.c_wkv, y.c_wkv_exl3, T, kDim, kHeadDim, pf.latent, nullptr, pf.ftmp);
             ops::rmsnorm(pf.latent, y.c_norm, pf.latent, kHeadDim, kNormEps, T);
             G = T;
             g0 = p0;
@@ -1902,8 +2233,8 @@ struct Engine::Impl {
                 ck(cudaMemcpyAsync(pf.csc, y.score_state, (size_t) carry * kHeadDim * 4, cudaMemcpyDeviceToDevice, 0),
                    "carry");
             }
-            prefill::bf16_gemm(pf.xa, y.c_wkv, T, kDim, kHeadDim, nullptr, pf.ckv + (size_t) carry * kHeadDim);
-            prefill::bf16_gemm(pf.xa, y.c_wgate, T, kDim, kHeadDim, nullptr, pf.csc + (size_t) carry * kHeadDim);
+            small_rows(pf.xa, y.c_wkv, y.c_wkv_exl3, T, kDim, kHeadDim, nullptr, pf.ckv + (size_t) carry * kHeadDim, nullptr);
+            small_rows(pf.xa, y.c_wgate, y.c_wgate_exl3, T, kDim, kHeadDim, nullptr, pf.csc + (size_t) carry * kHeadDim, nullptr);
             G = (carry + T) / r;
             g0 = (p0 - carry) / r;
             ops::compress_pool(pf.ckv, pf.csc, r, pf.latent, G);
@@ -1918,7 +2249,7 @@ struct Engine::Impl {
         }
         if (G > 0) {
             // indexer keys (decode: indexer(), have_latent), from the latent before its RoPE
-            prefill::bf16_gemm(pf.latent, y.idx_wk, G, kHeadDim, kIndexDim, pf.ik, nullptr, pf.ftmp);
+            small_rows(pf.latent, y.idx_wk, y.idx_wk_exl3, G, kHeadDim, kIndexDim, pf.ik, nullptr, pf.ftmp);
             ops::rmsnorm(pf.ik, y.idx_knorm, pf.ik, kIndexDim, kNormEps, G);
             prefill::rope_rows(pf.ik, G, 1, kIndexDim, rope_yarn, g0 * r, r, false);
             ops::fp4_quant_inplace(pf.ik, G * kIndexDim, 32, false);
@@ -1941,7 +2272,8 @@ struct Engine::Impl {
         fp8_rows(pf.qr, T, y.idx_wq_b, pf.iq);
         prefill::rope_rows(pf.iq, T, kIndexHeads, kIndexDim, rope_yarn, p0, 1, false);
         ops::fp4_quant_inplace(pf.iq, T * kIndexHeads * kIndexDim, 32, false);
-        prefill::bf16_gemm(pf.xa, y.idx_wp, T, kDim, kIndexHeads, pf.iw_raw, nullptr, pf.ftmp);
+        if (y.idx_wp_f16) fp16_weight_linear(pf.xa, y.idx_wp_f16, T, kDim, kIndexHeads, pf.iw_raw, nullptr);
+        else prefill::bf16_gemm(pf.xa, y.idx_wp, T, kDim, kIndexHeads, pf.iw_raw, nullptr, pf.ftmp);
         ops::scale_bf16(pf.iw_raw, (float) (std::pow(kIndexDim, -0.5) * std::pow(kIndexHeads, -0.5)), pf.iw,
                         T * kIndexHeads);
         uint8_t* cand = pf.cand + (size_t) b0 * max_seq;
@@ -2017,7 +2349,8 @@ struct Engine::Impl {
         auto& y = L[l];
         const bf16* xf = pf.xf + (size_t) b0 * kDim;
         pfp.mark(PfProfile::kRouter);
-        prefill::bf16_gemm(xf, y.gate_w, T, kDim, kExperts, nullptr, pf.router_logits);
+        if (y.gate_f16) fp16_weight_linear(xf, y.gate_f16, T, kDim, kExperts, nullptr, pf.router_logits);
+        else prefill::bf16_gemm(xf, y.gate_w, T, kDim, kExperts, nullptr, pf.router_logits);
         prefill::route_rows(pf.router_logits, y.gate_bias, T, pf.ids + (size_t) b0 * kTopK, pf.wts + (size_t) b0 * kTopK);
         if (pack.has_exl3_dense()) exl3_input_half(xf, pf.x_half + (size_t) b0 * kDim, T * kDim, 0);
         else ops::to_half_fp8q(xf, pf.x_half + (size_t) b0 * kDim, T * kDim);
@@ -2043,13 +2376,14 @@ struct Engine::Impl {
         std::vector<int> count(kExperts, 0);
         for (int i = 0; i < S * kTopK; ++i) {
             if (pfh.ids[i] < 0 || pfh.ids[i] >= kExperts) throw std::runtime_error("prefill: invalid routed expert");
-            if (partitioned() && !resident(l, pfh.ids[i])) throw std::runtime_error("resident prefill: expert missing from VRAM");
+            if (partitioned() && !experimental_29() && !resident(l, pfh.ids[i])) throw std::runtime_error("resident prefill: expert missing from VRAM");
             count[pfh.ids[i]]++;
         }
         std::vector<int> order;
         for (int e = 0; e < kExperts; ++e)
             if (count[e] && resident(l, e)) order.push_back(e);
         const int n_res = (int) order.size();
+        std::vector<int> stream_index(kExperts,-1);
         int64_t first_job;
         int n_jobs = 0;
         if (!partitioned() && S >= kStreamAll) {
@@ -2061,11 +2395,18 @@ struct Engine::Impl {
             std::vector<std::pair<int, int>> jobs;
             for (int e = 0; e < kExperts; ++e)
                 if (count[e] && !resident(l, e)) {
-                    jobs.push_back({l, e});
                     order.push_back(e);
+                    if(!prefill_cache_ || vram->prefill_gpu_slot(l,e)<0) {
+                        stream_index[e]=int(jobs.size());jobs.push_back({l,e});
+                    }
                 }
             n_jobs = (int) jobs.size();
             first_job = n_jobs ? estream->push(jobs) : 0;
+        }
+        if (pf.packed_waves) {
+            std::fill(pfh.wave_map, pfh.wave_map+kExperts, -1);
+            for (size_t i=0;i<order.size();++i) pfh.wave_map[order[i]]=int32_t(i);
+            ck(cudaMemcpyAsync(pf.wave_map,pfh.wave_map,kExperts*sizeof(int32_t),cudaMemcpyHostToDevice,0),"packed expert wave map");
         }
         std::vector<int> start(kExperts, 0), fill(kExperts, 0);
         std::vector<int32_t> off(order.size() + 1, 0);
@@ -2083,27 +2424,52 @@ struct Engine::Impl {
         ck(cudaMemcpyAsync(pf.rows_tok, pfh.rows_tok, (size_t) S * kTopK * 4, cudaMemcpyHostToDevice, 0), "rows up");
         ck(cudaMemcpyAsync(pf.rows_w, pfh.rows_w, (size_t) S * kTopK * 4, cudaMemcpyHostToDevice, 0), "rows up");
         const auto* xh = (const __half*) pf.x_half;
+        if(pf.expert_graphs && !prefill_expert_graphs)
+            prefill_expert_graphs=std::make_unique<kernels::Exl3PrefillGraphs>(xh,pf.rows_tok,pf.rows_w,pf.routed,pf.k12_ws,pf.k12_bytes);
+        auto packed_wave = [&](int first,int count,const kernels::Exl3Expert* descriptors) {
+            kernels::exl3_moe_remap_routes(pf.ids,pf.wave_map,S*kTopK,first,count,pf.wave_ids,0);
+            kernels::exl3_moe_prefill_grouped(xh,pf.wave_ids,pf.wts,S,kTopK,descriptors,nullptr,count,pf.routed,
+                                              pf.k12_ws,pf.k12_bytes,nullptr,0,off[first+count]-off[first]);
+        };
         pfp.mark(PfProfile::kExperts);
         if (n_res) {
             for (int i = 0; i < n_res; ++i) pfh.desc[i] = vram->desc(vram->res_host()[(size_t) l * kExperts + order[i]]);
             ck(cudaMemcpyAsync(pf.desc, pfh.desc, n_res * sizeof(kernels::Exl3Expert), cudaMemcpyHostToDevice, 0),
                "descriptors up");
-            kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data(), n_res, pf.desc, pf.routed, pf.k12_ws,
-                                      pf.k12_bytes, 0);
+            if (pf.packed_waves) packed_wave(0,n_res,pf.desc);
+            else if(pf.expert_graphs) prefill_expert_graphs->run(off.data(),n_res,pf.desc,0);
+            else if(pf.batch_groups) kernels::exl3_moe_prefill_batched(xh,pf.rows_tok,pf.rows_w,off.data(),n_res,pf.desc,
+                pf.routed,pf.k12_ws,pf.k12_bytes,pf.batch_groups,0);
+            else kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data(), n_res, pf.desc, pf.routed, pf.k12_ws,
+                                           pf.k12_bytes, 0);
             ptm->vram_experts += n_res;
         }
         const int group = std::max(1, pf.ring_slots / 4);
-        for (int g0 = 0; g0 < n_jobs; g0 += group) {
-            const int n = std::min(group, n_jobs - g0);
+        const int cold_groups=int(order.size())-n_res;
+        for (int g0 = 0; g0 < cold_groups; g0 += group) {
+            const int n = std::min(group, cold_groups - g0);
             for (int i = 0; i < n; ++i) {
-                uint8_t* slot = estream->wait(first_job + g0 + i, 0);   // stream 0 waits for the copy on the GPU
-                pfh.desc[kExperts + g0 + i] = VramExperts::describe_at(pack, l, order[n_res + g0 + i], slot);
+                const int e=order[n_res+g0+i];const int cached=prefill_cache_?vram->prefill_gpu_slot(l,e):-1;
+                if(cached>=0) { pfh.desc[kExperts+g0+i]=vram->desc(cached);++ptm->prefill_cached_gpu_groups; }
+                else {
+                    const int job=prefill_cache_?stream_index[e]:g0+i;
+                    uint8_t* slot=estream->wait(first_job+job,0);
+                    pfh.desc[kExperts+g0+i]=VramExperts::describe_at(pack,l,e,slot);
+                }
             }
             ck(cudaMemcpyAsync(pf.desc + kExperts + g0, pfh.desc + kExperts + g0, n * sizeof(kernels::Exl3Expert),
                                cudaMemcpyHostToDevice, 0), "descriptors up");
-            kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data() + n_res + g0, n, pf.desc + kExperts + g0,
-                                      pf.routed, pf.k12_ws, pf.k12_bytes, 0);
-            for (int i = 0; i < n; ++i) estream->release(first_job + g0 + i, 0);
+            if (pf.packed_waves) packed_wave(n_res+g0,n,pf.desc+kExperts+g0);
+            else if(pf.expert_graphs) prefill_expert_graphs->run(off.data()+n_res+g0,n,pf.desc+kExperts+g0,0);
+            else if(pf.batch_groups) kernels::exl3_moe_prefill_batched(xh,pf.rows_tok,pf.rows_w,off.data()+n_res+g0,n,
+                pf.desc+kExperts+g0,pf.routed,pf.k12_ws,pf.k12_bytes,pf.batch_groups,0);
+            else kernels::exl3_moe_prefill(xh, pf.rows_tok, pf.rows_w, off.data() + n_res + g0, n, pf.desc + kExperts + g0,
+                                           pf.routed, pf.k12_ws, pf.k12_bytes, 0);
+            for (int i = 0; i < n; ++i) {
+                const int e=order[n_res+g0+i];
+                if(prefill_cache_ && vram->prefill_gpu_slot(l,e)>=0) continue;
+                estream->release(first_job+(prefill_cache_?stream_index[e]:g0+i),0);
+            }
         }
         ptm->streamed += n_jobs;
     }
@@ -2262,7 +2628,8 @@ struct Engine::Impl {
                                        cudaMemcpyHostToDevice, 0), "engram scales");
                     ops::engram_dequant(dw, dw + rows * 256, (int) rows, pf.eng_vals);
                     fp8_rows(pf.eng_vals, T, y.eng_wkv, pf.eng_kv);
-                    ops::engram_apply(h, pf.eng_kv, y.eng_qw, y.eng_kw, kNormEps, T);
+                    if (experimental_29()) ops::engram_apply_f32(h, pf.eng_kv, y.eng_qw_f32, y.eng_kw_f32, kNormEps, T);
+                    else ops::engram_apply(h, pf.eng_kv, y.eng_qw, y.eng_kw, kNormEps, T);
                 }
                 pfp.mark(PfProfile::kHc);
                 hc_rows(h, T, y.hc_attn_fn, y.hc_attn_scale, y.hc_attn_base, pf.pre_mix + b0 * kHc, pf.xa, pf.attn_pre,
@@ -2431,17 +2798,8 @@ struct Engine::Impl {
     /// The GPU work of one decode step on stream st: every position dependent value comes from dp (staged from hp
     /// by the first node), so one capture serves every position with the same parity and indexer capacities.
     /// dump: eager only (it reads the device between layers).
-    void enqueue_step(StepDump* dump) {
-        if (stage.begin == 18) cur_comp = incoming_comp;
-        ck(cudaMemcpyAsync(dp, hp, sizeof(StepParams), cudaMemcpyHostToDevice, st), "step params");
-        ops::window_index_device(dp + 1, idx_dev, st);
-        if (stage.begin == 0) embedding(dp,1,1,h,st);
-        if (n_eng) engram_kv();
-        // the stream's collapse weights: one-hot at the first layer, then the previous layer's ffn_pre. Read in place:
-        // a 16-byte copy node per layer left a 12-24 us gap on the GPU chain (nsys, RTX 5090 Laptop)
-        const float* pre_in = stage.begin == 0 ? one_hot_dev : ffn_pre;
-        int eng_i = 0;
-        for (int l = stage.begin; l < stage.end; ++l) {
+    void enqueue_layers(int begin,int end,const float*& pre_in,int& eng_i,StepDump* dump) {
+        for (int l = begin; l < end; ++l) {
             auto& y = L[l];
             if (is_engram_layer(l) && eng_i < n_eng) engram(l, eng_i++);
             if (ds) dspark_capture(l, h, 1, ds_step_mh(), st);
@@ -2472,6 +2830,53 @@ struct Engine::Impl {
                    "dump hidden");
             }
         }
+    }
+
+    void enqueue_step_head() {
+        if (stage.begin == 18) cur_comp = incoming_comp;
+        ck(cudaMemcpyAsync(dp, hp, sizeof(StepParams), cudaMemcpyHostToDevice, st), "step params");
+        ops::window_index_device(dp + 1, idx_dev, st);
+        if (stage.begin == 0) embedding(dp,1,1,h,st);
+        if (n_eng) engram_kv();
+    }
+
+    void enqueue_step(StepDump* dump) {
+        const float* pre_in = stage.begin == 0 ? one_hot_dev : ffn_pre;
+        int eng_i = 0;
+        int begin = stage.begin;
+        if (static_graphs_ && static_warmed_ && !dump && !dbg && static_prefix_end_>stage.begin) {
+            const uint64_t key=uint64_t(parity) | uint64_t(tcap1)<<1 | uint64_t(tcap2)<<33;
+            auto it=static_graphs.find(key);
+            if(it==static_graphs.end()) {
+                ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"static prefix begin capture");
+                try {
+                    enqueue_step_head();
+                    enqueue_layers(stage.begin,static_prefix_end_,pre_in,eng_i,nullptr);
+                    // Join even tables consumed only by a later eager layer.
+                    for(int li=0;li<n_eng;++li) ck(cudaStreamWaitEvent(st,eng_join[li],0),"static prefix Engram join");
+                } catch(...) {
+                    cudaGraph_t abandoned=nullptr;
+                    cudaStreamEndCapture(st,&abandoned);
+                    if(abandoned) cudaGraphDestroy(abandoned);
+                    throw;
+                }
+                cudaGraph_t graph=nullptr;cudaGraphExec_t exec=nullptr;
+                ck(cudaStreamEndCapture(st,&graph),"static prefix end capture");
+                const auto status=cudaGraphInstantiate(&exec,graph,0);
+                cudaGraphDestroy(graph);
+                ck(status,"static prefix instantiate");
+                try { it=static_graphs.emplace(key,StaticGraph{exec,cur_comp,cur_index_k}).first; }
+                catch(...) { cudaGraphExecDestroy(exec);throw; }
+                ++static_captures_;
+            }
+            ck(cudaGraphLaunch(it->second.exec,st),"static prefix replay");
+            ++static_replays_;
+            cur_comp=it->second.comp;cur_index_k=it->second.index;
+            pre_in=ffn_pre;eng_i=0;
+            for(int l=stage.begin;l<static_prefix_end_;++l) eng_i+=is_engram_layer(l);
+            begin=static_prefix_end_;
+        } else enqueue_step_head();
+        enqueue_layers(begin,stage.end,pre_in,eng_i,dump);
         if (stage.end == kLayers) {
             ops::hc_pre(h, pre_in, final_x, 1, st);
             ops::rmsnorm(final_x, final_norm, final_x, kDim, kNormEps, 1, st);
@@ -2592,6 +2997,11 @@ struct Engine::Impl {
 
     int step_body(int token, int pos, StepDump* dump, Timing& tm, bool& released) {
         tm = Timing{};
+        const int64_t streamed_before = vram ? vram->streamed_decode_experts() : 0;
+        const int64_t ram_hits_before = vram ? vram->ram_cache_hits() : 0;
+        const uint64_t ram_bytes_before = vram ? vram->ram_cache_read_bytes() : 0;
+        const int64_t cached_batches_before = vram ? vram->cached_row_batches() : 0;
+        const int captures_before=static_captures_,replays_before=static_replays_;
         const double t_start = now_ms();
         history.push_back(pack.engram_hash().token_map[token]);
         {
@@ -2650,6 +3060,7 @@ struct Engine::Impl {
             enqueue_step(dump);
         }
         ck(cudaStreamSynchronize(st), "step");
+        static_warmed_=++static_eager_steps_>=2;
         if (n_eng) finish_engram(tm);
         if (prefetch && prefetch->failed()) throw std::runtime_error("ds41 prefetch: a DMA copy failed");
         const double t_end = now_ms();
@@ -2684,6 +3095,8 @@ struct Engine::Impl {
             }
         }
         tm.total_ms = now_ms() - t_start;
+        tm.static_graph_captures=static_captures_-captures_before;
+        tm.static_graph_replays=static_replays_-replays_before;
         tm.end_ms = now_ms() - t_end;
         tm.worker_lead_ms = resident_backend() ? 0 : worker_wake_at.load() - t_start;
         tm.worker_span_ms = worker_end_at.load() - worker_wake_at.load();
@@ -2693,6 +3106,13 @@ struct Engine::Impl {
         tm.cpu_experts_ms = worker_us.load() / 1000.0;
         tm.expert_total = (stage.end - stage.begin) * kTopK;
         tm.expert_hits = tm.expert_total - worker_misses.load();
+        if (experimental_29()) {
+            tm.streamed_experts = int(vram->streamed_decode_experts() - streamed_before);
+            tm.expert_hits -= tm.streamed_experts;
+            tm.ram_cached_uploads = int(vram->ram_cache_hits() - ram_hits_before);
+            tm.ram_cache_read_bytes = vram->ram_cache_read_bytes() - ram_bytes_before;
+            tm.cached_row_batches = int(vram->cached_row_batches() - cached_batches_before);
+        }
         tm.ram_experts = worker_ram.load();
         tm.file_experts = worker_file.load();
         tm.ssd_experts = worker_ssd.load();
@@ -2711,6 +3131,26 @@ struct Engine::Impl {
 #include "verify.cu"
 #include "batch.cu"
 #include "dspark.cu"
+
+void Engine::Impl::release_decode_scratch() {
+    // Prefill is entered only between committed windows. These allocations are
+    // disposable decode accelerators, not conversation state or backbone weights.
+    if (verify_pending) throw std::logic_error("commit the pending verify window before prefill");
+    const size_t cached = ds ? ds->cache_bytes : 0;
+    if (!verify_ws && !cached) return;
+    ck(cudaStreamSynchronize(st), "prefill decode scratch handoff");
+    const bool had_verify = bool(verify_ws);
+    verify_ws.reset();  // destroys captured graphs before their pointer-owning buffers
+    if (ds) {
+        for (auto& [id, entry] : ds->published_cache)
+            ck(cudaFree(entry.data), "prefill release draft cache");
+        ds->published_cache.clear();
+        ds->cache_bytes = ds->cache_limit = 0;
+        ds->cache_clock = 0;
+    }
+    std::fprintf(stderr, "ds41 resident prefill: stage %d..%d released decode scratch (verify %d, MTP cache %.3f GiB); state preserved\n",
+                 stage.begin, stage.end - 1, int(had_verify), cached / 1073741824.);
+}
 
 Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) {
     if (opt.devices.empty())
@@ -2756,9 +3196,10 @@ Engine::Engine(const std::string& pack_dir, const EngineOptions& opt) {
     impl_->handoff = std::make_unique<StageTransfer>(ranges[0].device, ranges[1].device,
                                                     kHc * kDim * sizeof(bf16), opt.force_host_handoff);
     std::fprintf(stderr, "ds41: resident split CUDA%d layers 0-%d -> CUDA%d layers %d-39, %s handoff; "
-                         "strict backbone routing, no CPU experts; bounded prefill and batched prefix verification\n",
+                         "strict backbone routing, no CPU experts; %s\n",
                  ranges[0].device, opt.split_layer - 1, ranges[1].device, opt.split_layer,
-                 impl_->handoff->peer() ? "peer" : "pinned-host");
+                 impl_->handoff->peer() ? "peer" : "pinned-host",
+                 impl_->experimental_29() ? "experimental bounded expert streaming, no verification" : "bounded prefill and batched prefix verification");
 }
 
 Engine::Engine(const std::string& pack_dir, int max_seq, int cpu_threads)
@@ -2815,6 +3256,12 @@ int Engine::step(int token, int pos, StepDump* dump) {
         timing_ = first;
         timing_.expert_total += last.expert_total;
         timing_.expert_hits += last.expert_hits;
+        timing_.streamed_experts += last.streamed_experts;
+        timing_.ram_cached_uploads += last.ram_cached_uploads;
+        timing_.ram_cache_read_bytes += last.ram_cache_read_bytes;
+        timing_.static_graph_captures += last.static_graph_captures;
+        timing_.static_graph_replays += last.static_graph_replays;
+        timing_.cached_row_batches += last.cached_row_batches;
         timing_.engram_ms += last.engram_ms;
         timing_.total_ms = timing_.gpu_ms = now_ms() - start;
         return next;
@@ -2840,7 +3287,7 @@ int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>*
         throw std::invalid_argument("DeepSeek split: empty, out-of-order or oversized prefill");
     for (int token : tokens) Impl::check_token(token);
     prefill_timing_ = PrefillTiming{};
-    if(tensor_) {
+    if(tensor_ && !impl_->experimental_29()) {
         const double start=now_ms();int next=-1;
         if(nll) nll->assign(tokens.size()-1,0.0f);
         try {
@@ -2861,13 +3308,23 @@ int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>*
         prefill_timing_.chunk_tokens=prefill_timing_.sub_batch=kVerifyMaxTokens;
         prefill_timing_.total_ms=now_ms()-start;return next;
     }
-    if (impl_->opt.prefill_chunk > 0 && !nll) {
+    if (impl_->opt.prefill_chunk > 0 && !nll && !tensor_) {
         const double start = now_ms();
         bool started = false;
         try {
+            const char* bulk = std::getenv("DS41_PF_BULK_HANDOFF");
+            if (bulk && std::strcmp(bulk, "0") && std::strcmp(bulk, "1"))
+                throw std::invalid_argument("DS41_PF_BULK_HANDOFF must be 0 or 1");
+            prefill_timing_.bulk_handoff = bulk && bulk[0] == '1';
+            impl_->handoff->reset_stats();
             impl_->ptm = tail_->ptm = &prefill_timing_;
             impl_->prefill_begin((int) tokens.size());
             tail_->prefill_begin((int) tokens.size());
+            prefill_timing_.attributed = impl_->pfp.on;
+            if (prefill_timing_.attributed) prefill_timing_.setup_ms = now_ms() - start;
+            prefill_timing_.batched_hc = impl_->pf.batched_hc;
+            prefill_timing_.stage_chunk = {impl_->pf.cap, tail_->pf.cap};
+            prefill_timing_.stage_batch = {impl_->pf.sub, tail_->pf.sub};
             const int cap = std::min(impl_->pf.cap, tail_->pf.cap);
             prefill_timing_.chunk_tokens = cap;
             prefill_timing_.sub_batch = std::min(impl_->pf.sub, tail_->pf.sub);
@@ -2882,21 +3339,60 @@ int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>*
             for (int c0 = 0; c0 < (int) tokens.size(); c0 += cap) {
                 const int S = std::min(cap, (int) tokens.size() - c0), p0 = pos + c0;
                 started = true;
+                const double stage_start = prefill_timing_.attributed ? now_ms() : 0;
                 impl_->prefill_pass(tokens, c0, S, p0, nullptr);
-                transfer(tail_->pf.h, impl_->pf.h, size_t(S) * kHc * kDim * 2);
-                transfer(tail_->pf.pre_mix, impl_->pf.pre_mix, size_t(S) * kHc * 4);
-                if (tail_->stage.begin == 18) {
-                    const size_t first = size_t(p0 / 2) * kHeadDim;
-                    const size_t rows = size_t((p0 + S) / 2 - p0 / 2);
-                    if (rows) transfer(tail_->incoming_comp + first, impl_->L[14].comp + first, rows * kHeadDim * 2);
-                    transfer(tail_->pf.topk, impl_->pf.topk, size_t(S) * kIndexTopK * 4);
+                if (prefill_timing_.attributed) prefill_timing_.stage_ms[0] += now_ms() - stage_start;
+                const double handoff_start = prefill_timing_.attributed ? now_ms() : 0;
+                const size_t first = size_t(p0 / 2) * kHeadDim;
+                const size_t rows = size_t((p0 + S) / 2 - p0 / 2);
+                if (prefill_timing_.bulk_handoff) {
+                    using Buffer = StageTransfer::Buffer;
+                    const Buffer h{tail_->pf.h, impl_->pf.h, size_t(S) * kHc * kDim * 2};
+                    const Buffer pre{tail_->pf.pre_mix, impl_->pf.pre_mix, size_t(S) * kHc * 4};
+                    if (tail_->stage.begin == 18) {
+                        const Buffer topk{tail_->pf.topk, impl_->pf.topk, size_t(S) * kIndexTopK * 4};
+                        if (rows) impl_->handoff->copy_group({h, pre,
+                            {tail_->incoming_comp + first, impl_->L[14].comp + first, rows * kHeadDim * 2}, topk}, nullptr, nullptr);
+                        else impl_->handoff->copy_group({h, pre, topk}, nullptr, nullptr);
+                    } else impl_->handoff->copy_group({h, pre}, nullptr, nullptr);
+                } else {
+                    transfer(tail_->pf.h, impl_->pf.h, size_t(S) * kHc * kDim * 2);
+                    transfer(tail_->pf.pre_mix, impl_->pf.pre_mix, size_t(S) * kHc * 4);
+                    if (tail_->stage.begin == 18) {
+                        if (rows) transfer(tail_->incoming_comp + first, impl_->L[14].comp + first, rows * kHeadDim * 2);
+                        transfer(tail_->pf.topk, impl_->pf.topk, size_t(S) * kIndexTopK * 4);
+                    }
                 }
+                if (prefill_timing_.attributed) prefill_timing_.handoff_ms += now_ms() - handoff_start;
+                const double tail_start = prefill_timing_.attributed ? now_ms() : 0;
                 tail_->prefill_pass(tokens, c0, S, p0, nullptr);
+                if (prefill_timing_.attributed) {
+                    DeviceScope scope(tail_->stage.device);
+                    ck(cudaStreamSynchronize(nullptr), "prefill attribution tail completion");
+                    prefill_timing_.stage_ms[1] += now_ms() - tail_start;
+                }
                 ++prefill_timing_.chunks;
                 if (impl_->progress && !impl_->progress(c0 + S, (int) tokens.size())) throw PrefillCancelled();
             }
+            const double cleanup_start = prefill_timing_.attributed ? now_ms() : 0;
             impl_->prefill_end(); tail_->prefill_end();
+            if (prefill_timing_.attributed) prefill_timing_.cleanup_ms = now_ms() - cleanup_start;
+            const auto& stats = impl_->handoff->stats();
+            prefill_timing_.handoff_bytes = stats.bytes;
+            prefill_timing_.handoff_copies = stats.copy_calls;
+            prefill_timing_.handoff_host_waits = stats.host_waits;
+            prefill_timing_.handoff_event_waits = stats.event_waits;
             prefill_timing_.total_ms = now_ms() - start;
+            if (prefill_timing_.attributed) std::fprintf(stderr,
+                "ds41 prefill attribution: wall_ms=%.3f setup_ms=%.3f stage0_ms=%.3f handoff_ms=%.3f stage1_ms=%.3f cleanup_ms=%.3f "
+                "stage_shapes=%d/%d,%d/%d handoff_bytes=%llu copy_calls=%llu host_waits=%llu event_waits=%llu "
+                "hc_calls=%llu hc_launches=%llu bulk=%d batched_hc=%d\n",
+                prefill_timing_.total_ms, prefill_timing_.setup_ms, prefill_timing_.stage_ms[0], prefill_timing_.handoff_ms,
+                prefill_timing_.stage_ms[1], prefill_timing_.cleanup_ms,
+                prefill_timing_.stage_chunk[0], prefill_timing_.stage_batch[0], prefill_timing_.stage_chunk[1], prefill_timing_.stage_batch[1],
+                (unsigned long long)stats.bytes, (unsigned long long)stats.copy_calls, (unsigned long long)stats.host_waits,
+                (unsigned long long)stats.event_waits, (unsigned long long)prefill_timing_.hc_calls,
+                (unsigned long long)prefill_timing_.hc_launches, int(prefill_timing_.bulk_handoff), int(prefill_timing_.batched_hc));
             const auto& lg = last_logits();
             return int(std::max_element(lg.begin(), lg.end()) - lg.begin());
         } catch (const PrefillCancelled&) {
@@ -2913,6 +3409,12 @@ int Engine::prefill(const std::vector<int>& tokens, int pos, std::vector<float>*
     try {
         for (size_t i = 0; i < tokens.size(); ++i) {
             next = step(tokens[i], pos + (int) i);
+            if (impl_->experimental_29()) {
+                prefill_timing_.streamed += timing_.streamed_experts;
+                prefill_timing_.vram_experts += timing_.expert_hits;
+                ++prefill_timing_.chunks;
+                prefill_timing_.chunk_tokens = prefill_timing_.sub_batch = 1;
+            }
             if (nll && i + 1 < tokens.size()) {
                 const auto& lg = last_logits();
                 const double mx = *std::max_element(lg.begin(), lg.end());

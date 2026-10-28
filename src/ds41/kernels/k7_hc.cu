@@ -1,5 +1,6 @@
 // src/ds41/kernels/k7_hc.cu - exact-order mixes with scalar register prefetch.
 #include "strata/ds41/kernels/k7_hc.hpp"
+#include "strata/ds41/kernels/k15_hc_prefill.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "k7/register_prefetch.hpp"
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <vector>
+#include <stdexcept>
 
 namespace strata::ds41::kernels {
 namespace {
@@ -239,9 +241,76 @@ __global__ void hc_coefficients(const float* __restrict__ scale, const float* __
     finish_token(scale, base, pre, post, comb, workspace, blockIdx.y);
 }
 
+// K15 owns one Workspace per tile rather than using K7's global eight-row
+// workspace. Every live lane retains K7's original stride-256 FMA chains and
+// shuffle tree. Tail lanes load zero instead of reading past the caller's rows.
+struct LoadRows {
+    const __nv_bfloat16* x;
+    const float* weights;
+    int original_lane, live;
+    __device__ __forceinline__ k7_detail::Stage<8> operator()(int step) const {
+        const int column = original_lane + step * kDotThreads;
+        k7_detail::Stage<8> stage;
+        stage.weight = weights[column];
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+            stage.values[t] = t < live ? __bfloat162float(x[t * kStreamSize + column]) : 0.0f;
+        return stage;
+    }
+};
+
+__global__ void hc_partials_rows(const __nv_bfloat16* __restrict__ x, int m,
+                                 const float* __restrict__ fn, Workspace* workspaces) {
+    const int tile = blockIdx.z, row = blockIdx.y, warp = blockIdx.x, lane = threadIdx.x;
+    const int live = min(8, m - tile * 8);
+    float dots[8] = {}, squares[8] = {};
+    k7_detail::register_prefetch<8, kStreamSize / kDotThreads>(
+        LoadRows{x + size_t(tile) * 8 * kStreamSize, fn + row * kStreamSize, warp * 32 + lane, live},
+        Fma{}, row, dots, squares);
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const float dot = warp_sum(dots[t]);
+        if (lane == 0) workspaces[tile].dots[t][row][warp] = dot;
+        if (row < kHc) {
+            const float square = warp_sum(squares[t]);
+            if (lane == 0) workspaces[tile].squares[t][row * kDotWarps + warp] = square;
+        }
+    }
+}
+
+__global__ void hc_finish_rows(const __nv_bfloat16* __restrict__ x,
+                               const float* __restrict__ scale, const float* __restrict__ base,
+                               const float* __restrict__ pre_in, __nv_bfloat16* __restrict__ y,
+                               float* __restrict__ pre, float* __restrict__ post, float* __restrict__ comb,
+                               const Workspace* workspaces) {
+    const int token = blockIdx.y, first = token / 8 * 8;
+    collapse_feature(x, pre_in, y, token, blockIdx.x * kThreads + threadIdx.x);
+    if (blockIdx.x != 0) return;
+    finish_token(scale, base, pre + first * kHc, post + first * kHc, comb + first * kHc * kHc,
+                 workspaces + token / 8, token % 8);
+}
+
 }  // namespace
 
 void hc_init() { (void) workspace_for_device(); }
+
+size_t hc_mixes_pre_rows_batched_workspace_bytes(int m) {
+    if (m < 1 || m > 16384) throw std::invalid_argument("batched K15 requires 1..16384 rows");
+    return size_t((m + 7) / 8) * sizeof(Workspace);
+}
+
+void hc_mixes_pre_rows_batched(const __nv_bfloat16* x, int m, const float* fn, const float* scale, const float* base,
+                               const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb,
+                               void* workspace, size_t bytes, cudaStream_t stream) {
+    const size_t required = hc_mixes_pre_rows_batched_workspace_bytes(m);
+    if (!x || !fn || !scale || !base || !pre_in || !y || !pre || !post || !comb || !workspace ||
+        reinterpret_cast<uintptr_t>(workspace) % 256 || bytes < required)
+        throw std::invalid_argument("batched K15 requires valid tensors and aligned caller-owned scratch");
+    hc_partials_rows<<<dim3(kDotWarps, kHcMix, (m + 7) / 8), kProducerThreads, 0, stream>>>(x, m, fn, static_cast<Workspace*>(workspace));
+    check_cuda(cudaGetLastError(), "batched K15 partials");
+    hc_finish_rows<<<dim3(kDim / kThreads, m), kThreads, 0, stream>>>(x, scale, base, pre_in, y, pre, post, comb, static_cast<const Workspace*>(workspace));
+    check_cuda(cudaGetLastError(), "batched K15 finish");
+}
 
 void hc_mixes_pre(const __nv_bfloat16* x, int m, const float* fn, const float* scale, const float* base,
                   const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb,

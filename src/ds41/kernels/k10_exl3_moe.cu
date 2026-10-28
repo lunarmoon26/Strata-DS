@@ -34,11 +34,23 @@ void exl3_moe_tensor_down(int m,const int32_t* selected,int topk,const Exl3Exper
 
 void exl3_moe_decode(const __half* x, int m, const int32_t* sel, const float* w, int topk,
                      const Exl3Expert* experts, float* out, void* workspace,
-                     size_t workspace_bytes, cudaStream_t stream) {
+                     size_t workspace_bytes, cudaStream_t stream, int uniform_bits) {
     // Guard before multiplication and before any launch. The device jobs use grid.y.
     if (m < 1 || m > 8 || topk < 1 || topk > 32767 / m ||
         !x || !sel || !w || !experts || !out || !workspace)
         throw std::invalid_argument("K10: invalid arguments");
+    if (uniform_bits < 0 || uniform_bits > 6)
+        throw std::invalid_argument("K10: uniform_bits must be 0..6");
+    static const bool rate_kernel = [] {
+        const char* value = std::getenv("DS41_EXPERIMENTAL_EXPERT_RATE_KERNEL");
+        if (!value || !std::strcmp(value, "0")) return false;
+        if (std::strcmp(value, "1"))
+            throw std::invalid_argument("DS41_EXPERIMENTAL_EXPERT_RATE_KERNEL must be 0 or 1");
+        return true;
+    }();
+    // Single-rate tables take the per-rate kernel: no mixed-rate dispatch, less
+    // shared memory and no spill stack. rows=1 keeps the one-row MMA/reduction
+    // order of the generic jobs kernel bit for bit.
     const int slots = m * topk;
     if (workspace_bytes < k10::Workspace::bytes(slots))
         throw std::invalid_argument("K10: insufficient workspace");
@@ -46,12 +58,26 @@ void exl3_moe_decode(const __half* x, int m, const int32_t* sel, const float* w,
         throw std::invalid_argument("K10: workspace must be 16-byte aligned");
     const k10::Workspace ws(workspace, slots);
 
+    static const bool grouped = [] {
+        const char* value = std::getenv("DS41_EXPERIMENTAL_GROUPED_EXPERTS");
+        if (!value || !std::strcmp(value, "0")) return false;
+        if (std::strcmp(value, "1"))
+            throw std::invalid_argument("DS41_EXPERIMENTAL_GROUPED_EXPERTS must be 0 or 1");
+        return true;
+    }();
+    const bool group_rows = grouped && m > 1 && topk <= 6;
+    const bool per_rate = rate_kernel && uniform_bits >= 1 && !group_rows;
+
     k10::input_had<<<dim3(2 * slots, k10::H / 128), 32, 0, stream>>>
         (x, sel, topk, experts, ws.input, ws.gu, ws.jobs);
-    strata_exl3::gemv_mul1(ws.jobs, 2 * slots, k10::F, stream);
+    if (per_rate) strata_exl3::gemv_mul1_rows(ws.jobs, 1, k10::F, uniform_bits, stream, 2 * slots);
+    else if (group_rows) strata_exl3::gemv_mul1_grouped(ws.jobs, 2 * slots, k10::F, ws.groups, stream);
+    else strata_exl3::gemv_mul1(ws.jobs, 2 * slots, k10::F, stream);
     k10::activate_down_had<<<dim3(slots, k10::F / 128), 32, 0, stream>>>
         (sel, w, experts, ws.gu, ws.down_input, ws.down, ws.jobs);
-    strata_exl3::gemv_mul1(ws.jobs, slots, k10::H, stream);
+    if (per_rate) strata_exl3::gemv_mul1_rows(ws.jobs, 1, k10::H, uniform_bits, stream, slots);
+    else if (group_rows) strata_exl3::gemv_mul1_grouped(ws.jobs, slots, k10::H, ws.groups, stream);
+    else strata_exl3::gemv_mul1(ws.jobs, slots, k10::H, stream);
     k10::output_had_add<<<dim3(m, k10::H / 128), 32, 0, stream>>>
         (sel, topk, experts, ws.down, out);
 }

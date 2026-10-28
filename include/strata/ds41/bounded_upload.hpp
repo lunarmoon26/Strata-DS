@@ -37,8 +37,31 @@ public:
         if (offset > size_ || bytes > size_ - offset)
             throw std::runtime_error("ds41: upload range past end of file");
     }
+    /// Borrow a complete immutable pinned payload for synchronous uploads only.
+    /// The owner keeps it alive until clear_source(); no cached file pointer.
+    void set_source(const uint8_t* data, uint64_t offset, size_t bytes) {
+        validate(offset, bytes);
+        if (!data || !bytes || source_) throw std::invalid_argument("invalid bounded upload RAM source");
+        source_ = data; source_offset_ = offset; source_bytes_ = bytes;
+    }
+    void clear_source() noexcept { source_ = nullptr; source_bytes_ = 0; }
+    void read_host(void* destination, uint64_t offset, size_t bytes) {
+        validate(offset, bytes);
+        size_t done = 0;
+        while (done < bytes) {
+            const ssize_t n = pread(fd_, static_cast<char*>(destination) + done, bytes - done, offset + done);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) throw std::runtime_error("ds41: short read during RAM cache fill");
+            done += size_t(n);
+        }
+        posix_fadvise(fd_, offset, bytes, POSIX_FADV_DONTNEED);
+    }
     uint32_t scalar_u32(uint64_t offset) const {
         validate(offset, 4);
+        if (source_) {
+            const auto* p = source_at(offset, 4);
+            return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+        }
         unsigned char bytes[4];
         size_t done = 0;
         while (done < sizeof(bytes)) {
@@ -51,6 +74,10 @@ public:
     }
     void copy(void* destination, uint64_t offset, uint64_t bytes) {
         validate(offset, bytes);
+        if (source_) {
+            device_check(cudaMemcpy(destination, source_at(offset, bytes), bytes, cudaMemcpyHostToDevice), "RAM expert upload");
+            return;
+        }
         for (uint64_t done = 0; done < bytes;) {
             const size_t n = static_cast<size_t>(std::min<uint64_t>(kStagingBytes, bytes - done));
             size_t got = 0;
@@ -74,6 +101,11 @@ public:
             first > row_bytes || !width || width > row_bytes-first || rows > SIZE_MAX/row_bytes)
             throw std::invalid_argument("ds41: invalid bounded column upload");
         validate(offset, uint64_t(rows)*row_bytes);
+        if (source_) {
+            device_check(cudaMemcpy2D(destination, width, source_at(offset, rows * row_bytes) + first,
+                                     row_bytes, width, rows, cudaMemcpyHostToDevice), "RAM expert shard upload");
+            return;
+        }
         const size_t batch = kStagingBytes / row_bytes;
         for (size_t done=0; done<rows;) {
             const size_t count=std::min(batch,rows-done), bytes=count*row_bytes;
@@ -92,9 +124,18 @@ public:
         }
     }
 private:
+    const uint8_t* source_at(uint64_t offset, uint64_t bytes) const {
+        if (offset < source_offset_ || offset - source_offset_ > source_bytes_ ||
+            bytes > source_bytes_ - (offset - source_offset_))
+            throw std::runtime_error("ds41: upload range outside pinned expert payload");
+        return source_ + (offset - source_offset_);
+    }
     int fd_ = -1;
     uint64_t size_ = 0;
     void* host_ = nullptr;
+    const uint8_t* source_ = nullptr;
+    uint64_t source_offset_ = 0;
+    size_t source_bytes_ = 0;
 };
 
 }  // namespace strata::ds41

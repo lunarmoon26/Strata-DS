@@ -187,9 +187,9 @@ __device__ __forceinline__ void dq8_regs_half(uint32_t a7, uint32_t b7, int s7, 
 // same bound to narrow integer GEMV: ptxas uses 63 registers without spills,
 // allowing 32 resident warps to cover the streaming trellis-load latency.
 // This changes register allocation only; keep the prefetch/MMA/fold body intact.
-template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false>
+template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE, bool HALF = false, bool REG56 = false, bool INDIRECT = false>
 __device__ __forceinline__
-void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
+void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1, const int* row_jobs = nullptr)
 {
     // A is already in the Hadamard basis. A null trellis marks an empty slot.
     const strata_exl3::GemvJob job = jobs[blockIdx.y];
@@ -201,8 +201,8 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
     const int size_k = job.k;
     const int size_n = job.n;
     static_assert(HALF ? (bits >= 1 && bits <= 3 && cb == 2)
-                       : ((bits >= 1 && bits <= 6 && cb == 2) || (bits == 2 && cb == 1)),
-                  "Strata GEMV supports mul1 K1..K6 or MCG K2");
+                       : ((bits >= 1 && bits <= 8 && cb == 2) || (bits == 2 && cb == 1)),
+                   "Strata GEMV supports mul1 K1..K8 or MCG K2");
     constexpr int WK   = CFG == 0 ? 16 : 8;     // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;      // adjacent n-tiles per warp
     constexpr int PF   = 2;                     // prefetch ring depth, independent of FOLD
@@ -217,6 +217,8 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
     // Strata: keep K2/K3/K4's register decoder and load schedule unchanged.
     // Other integer rates use the upstream shared-memory dq_dispatch template.
     constexpr bool GENERIC = !HALF && (bits == 1 || bits > 4);
+    constexpr bool REG_GENERIC = REG56 && !HALF && (bits == 5 || bits == 6);
+    constexpr bool SHARED_GENERIC = GENERIC && !REG_GENERIC;
     constexpr int TILE_LOADS = (TWORDS + 31) / 32;
     constexpr int STAGE_STRIDE = GENERIC ? TILE_LOADS * 32 : TWORDS;
     constexpr int LOADS = GENERIC ? WNT * TILE_LOADS : (TWO_PER_LOAD ? WNT / 2 : WNT);                       // warp loads per k-slice
@@ -243,6 +245,11 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
     const int r0 = lane >> 2;
     const size_t a_row0 = (size_t) r0 * (size_k / 2);
     const bool r0_ok = MMODE == 0 ? lane < 4 : r0 < size_m;
+    const half2* row_a = A2;
+    if constexpr (INDIRECT) {
+        static_assert(MMODE == 1 && c_fp32);
+        if (r0_ok) row_a = reinterpret_cast<const half2*>(jobs[row_jobs[r0]].A);
+    }
 
     // Per-lane extraction constants (see dq8_aligned_2bits / dq8<3, cb, 4> / dq8_half in exl3_dq.cuh)
     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
@@ -279,8 +286,13 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
         x_src_b = i2 % 24;
     }
 
-    __shared__ float sh_red[WK][ROWS][COLS];
-    [[maybe_unused]] __shared__ uint32_t sh_stage[(SMEM_STAGE || GENERIC) ? WK : 1][(SMEM_STAGE || GENERIC) ? LOADS * LSTRIDE : 1];
+    // Mixed-rate grouped dispatch shares one reduction buffer across its
+    // mutually exclusive template branches, rather than reserving one per rate.
+    extern __shared__ float grouped_reduction[];
+    __shared__ float reduction_storage[INDIRECT ? 1 : WK * ROWS * COLS];
+    auto sh_red = reinterpret_cast<float (*)[ROWS][COLS]>(
+        INDIRECT ? grouped_reduction : reduction_storage);
+    [[maybe_unused]] __shared__ uint32_t sh_stage[(SMEM_STAGE || SHARED_GENERIC) ? WK : 1][(SMEM_STAGE || SHARED_GENERIC) ? LOADS * LSTRIDE : 1];
 
     for (int group = blockIdx.x; group < num_groups; group += gridDim.x)
     {
@@ -347,7 +359,7 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
                     pf[d % PF][l] = ld_b(i + PF, l);
             }
 
-            if constexpr (SMEM_STAGE || GENERIC)
+            if constexpr (SMEM_STAGE || SHARED_GENERIC)
             {
                 __syncwarp();
                 #pragma unroll
@@ -360,8 +372,8 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
             FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+            a01[0] = r0_ok ? row_a[(INDIRECT ? 0 : a_row0) + a_col] : hzero;
+            a23[0] = r0_ok ? row_a[(INDIRECT ? 0 : a_row0) + a_col + 4] : hzero;
             a01[1] = hzero;
             a23[1] = hzero;
 
@@ -369,7 +381,28 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
             for (int t = 0; t < WNT; ++t)
             {
                 FragB f0, f1;
-                if constexpr (SMEM_STAGE || GENERIC)
+                if constexpr (REG_GENERIC && !SMEM_STAGE)
+                {
+                    // dq4's exact word indices and funnel shifts, sourced from
+                    // the two warp register loads instead of shared memory.
+                    auto word=[&](int index) {
+                        const uint32_t lo=__shfl_sync(0xffffffffu,bw[t*TILE_LOADS],index&31);
+                        const uint32_t hi=__shfl_sync(0xffffffffu,bw[t*TILE_LOADS+1],index&31);
+                        return index<32?lo:hi;
+                    };
+                    #pragma unroll
+                    for(int half=0;half<2;++half) {
+                        const int b0=((lane<<3)+half*4+257)*bits-16;
+                        const int b2=b0+3*bits+16;
+                        const int i0=b0/32,i2=(b2-1)/32,s2=(i2+1)*32-b2;
+                        const uint32_t a=word(i0%TWORDS),b=word(i2%TWORDS);
+                        const uint32_t w3=fshift(b,a,s2)&0xffff,w2=fshift(b,a,s2+bits)&0xffff;
+                        const uint32_t w1=fshift(b,a,s2+bits*2)&0xffff,w0=fshift(b,a,s2+bits*3)&0xffff;
+                        FragB& frag=half?f1:f0;
+                        frag[0]=decode_3inst_2<cb>(w0,w1);frag[1]=decode_3inst_2<cb>(w2,w3);
+                    }
+                }
+                else if constexpr (SMEM_STAGE || SHARED_GENERIC)
                 {
                     const uint32_t* tp = &sh_stage[warp][t * STAGE_STRIDE];
                     if constexpr (GENERIC)
@@ -465,7 +498,8 @@ void exl3_gemv_kernel(const strata_exl3::GemvJob* jobs, int rows = 1)
             for (int j = 0; j < WK; ++j)
                 sum += sh_red[j][r][c];
             const int col = group * COLS + c;
-            if constexpr (c_fp32) ((float*) C)[(size_t) r * size_n + col] = sum;
+            if constexpr (INDIRECT) jobs[row_jobs[r]].C[col] = sum;
+            else if constexpr (c_fp32) ((float*) C)[(size_t) r * size_n + col] = sum;
             else                  ((half*)  C)[(size_t) r * size_n + col] = __float2half_rn(sum);
         }
         __syncthreads();

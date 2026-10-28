@@ -24,16 +24,19 @@ __global__ void hc_mean_k(const bf16* h, bf16* out, int64_t stride) {
 }
 
 /// one block per row: each warp scores experts e = warp, warp + nw, ...; thread 0 picks
-__global__ void router_small_k(const bf16* x, const bf16* w, const float* bias, int n_exp, int topk, int32_t* ids,
+template<bool Scores=false>
+__global__ void router_small_k(const bf16* x, const bf16* w, const float* scores,const float* bias, int n_exp, int topk, int32_t* ids,
                                float* weights) {
     __shared__ float s[256];
     const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    const bf16* xr = x + (size_t) r * kDim;
     for (int e = warp; e < n_exp; e += nw) {
-        const bf16* we = w + (size_t) e * kDim;
         float acc = 0;
-        for (int d = lane; d < kDim; d += 32) acc += __bfloat162float(xr[d]) * __bfloat162float(we[d]);
-        for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if constexpr(Scores) acc=scores[size_t(r)*n_exp+e];
+        else {
+            const bf16* xr=x+size_t(r)*kDim;const bf16* we=w+size_t(e)*kDim;
+            for (int d = lane; d < kDim; d += 32) acc += __bfloat162float(xr[d]) * __bfloat162float(we[d]);
+            for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        }
         if (lane == 0) s[e] = sqrtf(acc > 20.0f ? acc : log1pf(expf(acc)));
     }
     __syncthreads();
@@ -60,7 +63,10 @@ __global__ void router_small_k(const bf16* x, const bf16* w, const float* bias, 
 }
 
 /// a warp per vocab row: 256 weights, 8 per lane
-__global__ void markov_bias_k(const int* token, const bf16* embed, const bf16* head, int64_t n_vocab, float* logits,
+__device__ inline float weight_float(bf16 value) { return __bfloat162float(value); }
+__device__ inline float weight_float(half value) { return __half2float(value); }
+template<class Weight>
+__global__ void markov_bias_k(const int* token, const bf16* embed, const Weight* head, int64_t n_vocab, float* logits,
                               bf16* embed_out) {
     __shared__ float e[kMarkovRank];
     const bf16* er = embed + (size_t) *token * kMarkovRank;
@@ -72,21 +78,22 @@ __global__ void markov_bias_k(const int* token, const bf16* embed, const bf16* h
     const int lane = threadIdx.x & 31;
     const int64_t v = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (v >= n_vocab) return;
-    const bf16* hr = head + v * kMarkovRank;
+    const Weight* hr = head + v * kMarkovRank;
     float acc = 0;
-    for (int i = lane; i < kMarkovRank; i += 32) acc += __bfloat162float(hr[i]) * e[i];
+    for (int i = lane; i < kMarkovRank; i += 32) acc += weight_float(hr[i]) * e[i];
     for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (lane == 0) logits[v] += acc;
 }
 
-__global__ void confidence_k(const bf16* x, const bf16* e, const bf16* w, float* out) {
+template<class Weight>
+__global__ void confidence_k(const bf16* x, const bf16* e, const Weight* w, float* out) {
     __shared__ float part[32];
     const int r = blockIdx.x;
     float acc = 0;
     for (int d = threadIdx.x; d < kDim + kMarkovRank; d += blockDim.x) {
         const float a = d < kDim ? __bfloat162float(x[(size_t) r * kDim + d])
                                  : __bfloat162float(e[(size_t) r * kMarkovRank + d - kDim]);
-        acc += a * __bfloat162float(w[d]);
+        acc += a * weight_float(w[d]);
     }
     for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
@@ -113,8 +120,16 @@ void hc_mean_rows(const bf16* h, int m, bf16* out, int64_t out_stride, cudaStrea
 void router_small(const bf16* x, int m, const bf16* w, const float* bias, int n_exp, int topk, int32_t* ids,
                   float* weights, cudaStream_t stream) {
     if (n_exp < 1 || n_exp > 256 || topk < 1 || topk > 8 || topk > n_exp) throw std::invalid_argument("router_small shape");
-    router_small_k<<<m, 512, 0, stream>>>(x, w, bias, n_exp, topk, ids, weights);
+    router_small_k<<<m, 512, 0, stream>>>(x, w, nullptr,bias, n_exp, topk, ids, weights);
     check(cudaGetLastError(), "router_small");
+}
+
+void router_small_scores(const float* scores,int m,const float* bias,int n_exp,int topk,int32_t* ids,
+                         float* weights,cudaStream_t stream) {
+    if(!scores || !bias || !ids || !weights || m<1 || n_exp<1 || n_exp>256 || topk<1 || topk>8 || topk>n_exp)
+        throw std::invalid_argument("router_small_scores shape/buffers");
+    router_small_k<true><<<m,512,0,stream>>>(nullptr,nullptr,scores,bias,n_exp,topk,ids,weights);
+    check(cudaGetLastError(),"router_small_scores");
 }
 
 void markov_bias(const int* token, const bf16* embed, const bf16* head, int64_t n_vocab, float* logits,
@@ -128,6 +143,19 @@ void markov_bias(const int* token, const bf16* embed, const bf16* head, int64_t 
 void confidence_rows(const bf16* x, const bf16* e, const bf16* w, int m, float* out, cudaStream_t stream) {
     confidence_k<<<m, 256, 0, stream>>>(x, e, w, out);
     check(cudaGetLastError(), "confidence_rows");
+}
+
+void markov_bias(const int* token,const bf16* embed,const half* head,int64_t n_vocab,float* logits,
+                 bf16* embed_out,cudaStream_t stream) {
+    if(!token || !embed || !head || !logits || !embed_out || n_vocab<1) throw std::invalid_argument("FP16 markov buffers");
+    constexpr int rows=8;
+    markov_bias_k<<<unsigned((n_vocab+rows-1)/rows),rows*32,0,stream>>>(token,embed,head,n_vocab,logits,embed_out);
+    check(cudaGetLastError(),"FP16 markov bias");
+}
+void confidence_rows(const bf16* x,const bf16* e,const half* w,int m,float* out,cudaStream_t stream) {
+    if(!x || !e || !w || !out || m<1) throw std::invalid_argument("FP16 confidence buffers");
+    confidence_k<<<m,256,0,stream>>>(x,e,w,out);
+    check(cudaGetLastError(),"FP16 confidence");
 }
 
 void block_index(const int* start_pos, int32_t* idx, cudaStream_t stream) {

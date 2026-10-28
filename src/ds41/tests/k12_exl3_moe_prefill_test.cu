@@ -241,12 +241,52 @@ void grouped_k(Verdict& v,bool native_qdq,int T,int n_exp=6) {
     };
     enqueue(0);ck(cudaDeviceSynchronize(),"grouped prefill");
     const auto result=got.down();const double err=delta_err(result,want.down(),init);
+    for(int wave:{1,3,8,16}) {
+        const size_t batched_bytes=kk::exl3_moe_batched_workspace_bytes(c.start[n_exp],wave);
+        Dev<uint8_t> batch_ws(batched_bytes);Dev<float> batch_out(init);
+        auto batch_enqueue=[&](cudaStream_t st) {
+            kk::exl3_moe_prefill_batched(r.x.p,r.tok.p,r.w.p,c.start.data(),n_exp,ordered.p,batch_out.p,
+                                         batch_ws.p,batched_bytes,wave,st);
+        };
+        batch_enqueue(0);ck(cudaDeviceSynchronize(),"exact batched prefill");
+        const auto batched_result=batch_out.down(),expected=want.down();
+        v.check(!std::memcmp(batched_result.data(),expected.data(),expected.size()*sizeof(float)),
+                "batched reconstruction retains byte-identical reference output for every wave size");
+        if(wave==8 && T==129) {
+            graph_check(v,"exact batched expert graph",[&](cudaStream_t st) {
+                ck(cudaMemsetAsync(batch_out.p,0,batch_out.n*sizeof(float),st),"batched graph reset");batch_enqueue(st);
+            },[&] { return as_doubles(batch_out.down()); },[&] { poison_dev(batch_out);poison_dev(batch_ws); });
+            std::printf("exact batched synthetic T=%d native_qdq=%d wave=%d us=%.1f\n",T,native_qdq,wave,
+                         median_us([&] { batch_enqueue(0); },5));
+        }
+        if(wave==3) {
+            bool refused=false;
+            try { kk::exl3_moe_prefill_batched(r.x.p,r.tok.p,r.w.p,c.start.data(),n_exp,ordered.p,batch_out.p,
+                                               batch_ws.p,batched_bytes-1,wave,0); }
+            catch(const std::invalid_argument&) { refused=true; }
+            v.check(refused || !c.start[n_exp],"batched reconstruction rejects undersized scratch");
+        }
+    }
     std::printf("grouped K1..K6 T=%d experts=%d native_qdq=%d rel_l2=%.9g workspace=%.1f MiB\n",T,n_exp,native_qdq,err,bytes/1048576.);
     v.check(std::isfinite(err) && err<1e-2,"grouped K: relative L2 above 1e-2 against K12");
     int active_expected=0;for(int e=0;e<n_exp;++e) active_expected+=c.start[e+1]>c.start[e];
     v.check(active.down()[0]==active_expected,"grouped K: active group count");
     bool idle_same=true;for(int t:{0,T-1}) for(int d=0;d<H;++d) idle_same &= result[size_t(t)*H+d]==init[size_t(t)*H+d];
     v.check(idle_same,"grouped K: idle row changed");
+    {
+        std::vector<int32_t> map(384,-1);for(int e=0;e<n_exp;++e) map[e]=e;
+        Dev<int32_t> wave_map(map),filtered(c.sel.size());Dev<float> wave_out(init);
+        for(int first=0;first<n_exp;first+=3) {
+            const int count=std::min(3,n_exp-first);
+            kk::exl3_moe_remap_routes(ids.p,wave_map.p,T*TOPK,first,count,filtered.p,0);
+            kk::exl3_moe_prefill_grouped(r.x.p,filtered.p,weights.p,T,TOPK,ordered.p+first,nullptr,count,
+                                         wave_out.p,ws.p,bytes,nullptr,0,c.start[first+count]-c.start[first]);
+        }
+        ck(cudaDeviceSynchronize(),"packed ordered waves");
+        const auto split=wave_out.down();
+        v.check(!std::memcmp(split.data(),result.data(),split.size()*sizeof(float)),
+                "ordered packed waves preserve full-call accumulation exactly, including idle rows");
+    }
     graph_check(v,"grouped K graph",
         [&](cudaStream_t st) { ck(cudaMemsetAsync(got.p,0,got.n*sizeof(float),st),"grouped reset");enqueue(st); },
         [&] { return as_doubles(got.down()); },[&] { poison_dev(got);poison_dev(ws); });
@@ -263,11 +303,94 @@ void grouped_k(Verdict& v,bool native_qdq,int T,int n_exp=6) {
     v.check(rejected,"grouped K: short workspace accepted");
 }
 
+void batched_contract(Verdict& v) {
+    Experts ex(1,true);ex.host[0].native_qdq=false;
+    // Empty groups have no valid descriptors and must never be reconstructed.
+    Dev<kk::Exl3Expert> descriptors(std::vector<kk::Exl3Expert>{{},ex.host[0],{}});
+    const int32_t offsets[]={0,0,513,513};
+    std::vector<int32_t> tokens(513);std::iota(tokens.begin(),tokens.end(),0);
+    Dev<int32_t> tok(tokens);Dev<float> weights(std::vector<float>(513,.25f));
+    Dev<half> input(Run::to_half(rand_f32(size_t(513)*H,1.f,918)));
+    Dev<float> reference(std::vector<float>(size_t(513)*H,0)),output(std::vector<float>(size_t(513)*H,0));
+    const size_t bytes=kk::exl3_moe_batched_workspace_bytes(513,3);Dev<uint8_t> ws(bytes);
+    kk::exl3_moe_prefill(input.p,tok.p,weights.p,offsets,3,descriptors.p,reference.p,ws.p,bytes,0);
+    kk::exl3_moe_prefill_batched(input.p,tok.p,weights.p,offsets,3,descriptors.p,output.p,ws.p,bytes,3,0);
+    const auto got=output.down(),want=reference.down();
+    v.check(!std::memcmp(got.data(),want.data(),got.size()*sizeof(float)),
+            "batched prefill preserves reference tiling above 512 rows and skips empty invalid descriptors");
+    const int32_t small[]={0,0,1,1};
+    ck(cudaMemset(output.p,0,output.n*sizeof(float)),"batched small reset");
+    kk::exl3_moe_prefill_batched(input.p,tok.p,weights.p,small,3,descriptors.p,output.p,ws.p,bytes,3,0);
+    ck(cudaDeviceSynchronize(),"batched empty groups");
+    v.check(true,"batched reconstruction skips empty descriptors without the tiled fallback");
+    for(int wave:{0,17}) {
+        bool refused=false;try { (void)kk::exl3_moe_batched_workspace_bytes(513,wave); }
+        catch(const std::invalid_argument&) { refused=true; }
+        v.check(refused,"batched wave budget rejects zero and oversized groups");
+    }
+    const int32_t invalid[]={1,0};bool refused=false;
+    try { kk::exl3_moe_prefill_batched(input.p,tok.p,weights.p,invalid,1,descriptors.p,output.p,ws.p,bytes,3,0); }
+    catch(const std::invalid_argument&) { refused=true; }
+    v.check(refused,"batched prefill rejects decreasing offsets before GPU access");
+    v.check(kk::exl3_moe_batched_workspace_bytes(0,3)==0,"empty batched calls need no workspace");
+}
+
+void expert_graph_contract(Verdict& v,bool native_qdq) {
+    Experts ex(3,true);for(auto& e:ex.host) e.native_qdq=native_qdq;
+    Dev<kk::Exl3Expert> experts(ex.host);
+    Dev<half> x(Run::to_half(rand_f32(size_t(130)*H,1.f,724)));
+    std::vector<int32_t> tokens(130);std::iota(tokens.begin(),tokens.end(),0);
+    Dev<int32_t> tok(tokens);Dev<float> weights(std::vector<float>(130,.25f));
+    const auto initial=rand_f32(size_t(130)*H,.5f,725);Dev<float> want(initial),got(initial);
+    const size_t bytes=kk::exl3_moe_prefill_workspace_bytes(512,1);
+    Dev<uint8_t> ref_ws(bytes),graph_ws(bytes);
+    cudaStream_t stream;ck(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"expert graph test stream");
+    {
+        kk::Exl3PrefillGraphs cache(x.p,tok.p,weights.p,got.p,graph_ws.p,bytes);
+        for(int i=0;i<36;++i) {
+            const int32_t offsets[]={i%11,i%11+1+2*(i%3)};
+            kk::exl3_moe_prefill(x.p,tok.p,weights.p,offsets,1,experts.p+i%3,want.p,ref_ws.p,bytes,stream);
+            cache.run(offsets,1,experts.p+i%3,stream);
+        }
+        ck(cudaStreamSynchronize(stream),"queued expert parameter updates");
+        const auto g=got.down(),w=want.down();
+        v.check(!std::memcmp(g.data(),w.data(),g.size()*sizeof(float)),
+                "expert graphs preserve reference bits with queued descriptor/offset updates and no host fences");
+        v.check(cache.captures()==3 && cache.replays()==33 && cache.shapes()==3,"expert graph warm/capture/replay accounting");
+        bool refused=false;
+        const int32_t off[]={0,1};
+        try { cache.run(off,1,experts.p,0); } catch(const std::invalid_argument&) { refused=true; }
+        v.check(refused,"expert graph owner refuses stream changes before enqueue");
+        // Exercise the fixed 128-shape ceiling and eager fallback without
+        // allocating an unbounded graph for every new routing histogram.
+        for(int count=1;count<=129;++count) {
+            const int32_t offsets[]={0,count};cache.run(offsets,1,experts.p,stream);
+        }
+        v.check(cache.shapes()==128 && cache.captures()<=128,"expert graph shapes remain bounded with eager overflow");
+    }
+    ck(cudaStreamDestroy(stream),"expert graph test stream release");
+    v.check(true,"expert graph owner joins work and destroys bindings before scratch release");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     require_gpu();
     Verdict v;
+    batched_contract(v);
+    expert_graph_contract(v,true);expert_graph_contract(v,false);
+    {
+        std::vector<int32_t> map(384,-1);
+        const int order[]={5,2,0,4,1,3};for(int i=0;i<6;++i) map[order[i]]=i;
+        Dev<int32_t> ids(std::vector<int32_t>{0,5,4,2,383,1,3,5,-1}),mapping(map),filtered(9);
+        kk::exl3_moe_remap_routes(ids.p,mapping.p,9,2,3,filtered.p,0);
+        v.check(filtered.down()==std::vector<int32_t>({0,-1,1,-1,-1,2,-1,-1,-1}),
+                "expert wave filters nonidentity hot/cold maps, missing experts and padding");
+        bool refused=false;
+        try { kk::exl3_moe_remap_routes(ids.p,mapping.p,9,383,2,filtered.p,0); }
+        catch(const std::invalid_argument&) { refused=true; }
+        v.check(refused,"expert wave rejects descriptor ranges outside the layer");
+    }
     for(int T:{1,37,129}) { grouped_k(v,true,T);grouped_k(v,false,T); }
     grouped_k(v,false,1024,12);
     mixed_k(v);

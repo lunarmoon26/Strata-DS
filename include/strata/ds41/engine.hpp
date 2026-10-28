@@ -100,6 +100,17 @@ struct PrefillTiming {
     int chunks = 0, chunk_tokens = 0, sub_batch = 0;           ///< passes, tokens per pass, tokens per sub-batch
     int64_t vram_experts = 0;                                  ///< (layer, expert) pairs computed from VRAM slots
     int64_t streamed = 0, from_ram = 0, from_cache = 0, from_ssd = 0;   ///< pairs copied through the ring, by source
+    /// Opt-in profile wall attribution. Stage wall includes host scheduling and
+    /// waits, not pure device-kernel time. Profiling fences each stage boundary.
+    bool attributed = false, bulk_handoff = false, batched_hc = false;
+    double setup_ms = 0, cleanup_ms = 0, handoff_ms = 0;
+    std::array<double, 2> stage_ms{};
+    std::array<int, 2> stage_chunk{}, stage_batch{};
+    uint64_t handoff_bytes = 0, handoff_copies = 0, handoff_host_waits = 0, handoff_event_waits = 0;
+    uint64_t hc_calls = 0, hc_launches = 0;
+    uint64_t expert_graph_captures = 0, expert_graph_replays = 0;
+    uint64_t prefill_cached_gpu_groups = 0;
+    double prefill_cache_prime_ms = 0; ///< included in setup/total wall time
 };
 
 /// Thrown by prefill() when the progress callback returned false. The engine is then back at position 0.
@@ -126,6 +137,7 @@ public:
     /// Check a tentative window at the committed position. Call commit before step, prefill, or verify again.
     /// Each output is the greedy next token after that input row. CPU windows are capped at four rows.
     VerifyResult verify(const std::vector<int>& window, int pos, bool logits = false);
+    int verify_capacity() const; ///< default four; opt-in experimental resident bound at most six
     /// Keep the first n_keep inputs (1..T). Discard every later input and its state.
     void commit(int n_keep);
 
@@ -136,8 +148,10 @@ public:
         int n = 0;
         std::array<int, 5> tokens{};
         std::array<float, 5> accept{};
-        double ms = 0, cpu_experts_ms = 0;   ///< the whole call; the CPU's routed experts inside it
+        double ms = 0, cpu_experts_ms = 0;   ///< DSpark stage time; split embedding/handoff is separate
         int vram_hits = 0, uses = 0;          ///< routed uses computed from DSpark's VRAM set, of all
+        double embedding_handoff_ms = 0;       ///< split-only embedding and handoff wall time
+        uint64_t embedding_handoff_groups = 0, embedding_handoff_copies = 0, embedding_handoff_host_waits = 0;
     };
     Draft draft(int token);
     bool has_dspark() const;
@@ -192,8 +206,15 @@ public:
     struct Timing {
         double gpu_ms = 0, cpu_experts_ms = 0, engram_ms = 0, total_ms = 0;
         int expert_hits = 0, expert_total = 0;   ///< VRAM hits and all routed uses
+        int streamed_experts = 0;              ///< experimental host/file -> GPU uploads, not CPU experts
+        int ram_cached_uploads = 0;            ///< uploads served by the bounded pinned RAM cache
+        uint64_t ram_cache_read_bytes = 0;     ///< file bytes read to populate that cache, not measured physical SSD I/O
+        int static_graph_captures = 0, static_graph_replays = 0; ///< experimental prefixes and opt-in verifier tail segments
+        int cached_row_batches = 0; ///< hit-only bounded expert admissions, not host-staged rows
+        int async_cached_row_reads = 0; ///< two-phase verifier reads issued, including misses
+        uint64_t verify_handoff_groups = 0, verify_handoff_copies = 0, verify_handoff_host_waits = 0;
         int cpu_experts() const { return ram_experts + file_experts; }
-        int zero_copy_experts() const { return expert_total - expert_hits - cpu_experts() - skipped; }
+        int zero_copy_experts() const { return expert_total - expert_hits - streamed_experts - cpu_experts() - skipped; }
         int vram_swaps = 0;   ///< adaptive swaps committed before this step
         /// the CPU's experts by tier: from the RAM copy, from the mapped file, and of those, the ones with pages
         /// missing from RAM when computed (read from the SSD)

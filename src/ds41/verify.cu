@@ -3,9 +3,9 @@
 namespace {
 // Save the append-only tail. Rows outside the allocated context are never read.
 __global__ void verify_tail_copy(bf16* backup, bf16* cache, const int* params, int width,
-                                int ratio, int capacity, int keep, bool restore) {
+                                int ratio, int capacity, int keep, bool restore, int slots) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= kVerifyMaxTokens * width) return;
+    if (i >= slots * width) return;
     const int row = params[1] / ratio + i / width;
     if (row >= capacity) return;
     const int j = row * width + i % width;
@@ -15,7 +15,7 @@ __global__ void verify_tail_copy(bf16* backup, bf16* cache, const int* params, i
 } // namespace
 
 struct Engine::Impl::VerifyWorkspace {
-    static constexpr int M = kVerifyMaxTokens;
+    const int M;
     std::vector<std::shared_ptr<void>> device, pinned;
     template<class T> T* alloc(size_t n) {
         T* p = dalloc<T>(std::max<size_t>(1, n));
@@ -44,7 +44,7 @@ struct Engine::Impl::VerifyWorkspace {
     // the window's engram rows, read by the engine's reader thread beside the first layers (post_engram): per table
     // the rows of all tokens, M * kEngRows weights then M * kEngRows scales (TB bytes), in mapped pinned memory;
     // the GPU copies a table once its flag rises, on st_eng, and computes its wkv GEMV there (veng_kv)
-    static constexpr size_t TB = size_t(M) * kEngRows * (256 + 8);
+    const size_t TB;
     std::vector<std::unique_ptr<EngramRows>> veng_rows;
     std::vector<std::vector<int64_t>> veng_ids;
     uint8_t *veng = nullptr, *veng_host = nullptr;
@@ -54,6 +54,10 @@ struct Engine::Impl::VerifyWorkspace {
     float *act_kv = nullptr, *act_sh = nullptr;   // the FP8 activation scratch of the kv branch and the shared expert
     EngJob job;
     std::map<std::array<int64_t, 4>, cudaGraphExec_t> graphs;
+    struct PrefixGraph { cudaGraphExec_t exec; const bf16* comp; const bf16* keys; int engrams; };
+    std::map<std::array<int64_t,4>,PrefixGraph> prefix_graphs;
+    std::map<std::array<int64_t,5>,PrefixGraph> layer_graphs;
+    int prefix_captures=0,prefix_replays=0;
     std::vector<int> tokens;
     int pos = 0, m = 0;
     bool warmed = false;
@@ -61,7 +65,7 @@ struct Engine::Impl::VerifyWorkspace {
     void *dense = nullptr, *dense_kv = nullptr, *dense_shared = nullptr, *dense_engram = nullptr;
     size_t dense_bytes = 0;
     bf16* incoming_backup = nullptr;
-    VerifyWorkspace(Impl& e) {
+    VerifyWorkspace(Impl& e) : M(e.verify_rows_), TB(size_t(M)*kEngRows*(256+8)) {
         const int S = e.max_seq;
         params = alloc<int>(M * 4 + 1); params_host = pin<int>(M * 4 + 1);   // [M * 4]: the engram epoch
         next = alloc<int>(M); next_host = pin<int>(M);
@@ -86,6 +90,9 @@ struct Engine::Impl::VerifyWorkspace {
         if (!e.resident_backend()) db = std::make_unique<ExpertDoorbell>(M, kTopK, kDim);
         if (e.pack.has_exl3_dense()) {
             dense_bytes = exl3_small_rows_workspace_bytes(M, 32768, kVocab);
+            if (e.batch_projections_)
+                dense_bytes = std::max(dense_bytes, exl3_projection_batch_workspace_bytes(
+                    kOGroups,M,kHeads*kHeadDim/kOGroups,kOLora));
             dense = alloc<uint8_t>(dense_bytes);
             dense_kv = alloc<uint8_t>(dense_bytes);
             dense_shared = alloc<uint8_t>(dense_bytes);
@@ -129,6 +136,8 @@ struct Engine::Impl::VerifyWorkspace {
     }
     ~VerifyWorkspace() {
         for (auto& entry : graphs) cudaGraphExecDestroy(entry.second);
+        for(auto& entry:prefix_graphs) cudaGraphExecDestroy(entry.second.exec);
+        for(auto& entry:layer_graphs) cudaGraphExecDestroy(entry.second.exec);
     }
 };
 
@@ -150,7 +159,8 @@ void Engine::Impl::enqueue_verify(int m) {
     auto linear = [&](const bf16* x, const Fp8& w, bf16* out,bool communicate=true,bool acknowledge=true) {
         linear_on(x,w,out,v.act,st,communicate,acknowledge);
     };
-    ck(cudaMemcpyAsync(v.params, v.params_host, (VerifyWorkspace::M*4+1)*sizeof(int), cudaMemcpyHostToDevice, st),
+    auto verify_head=[&] {
+    ck(cudaMemcpyAsync(v.params, v.params_host, (v.M*4+1)*sizeof(int), cudaMemcpyHostToDevice, st),
        "verify params");
     if (n_eng) {
         // per table on st_eng, as the step's engram_kv: wait for the rows, copy, dequantize (token by token, rows of
@@ -160,19 +170,19 @@ void Engine::Impl::enqueue_verify(int m) {
         ck(cudaStreamWaitEvent(st_eng, eng_fork, 0), "verify engram fork wait");
         for (int li = 0; li < n_eng; ++li) {
             const auto& y = L[pack.engram_tables()[li].layer];
-            wait_engram_k<<<1, 1, 0, st_eng>>>(eng_flag_dev + li*kEngFlagStride, v.params + VerifyWorkspace::M*4 - 4);
+            wait_engram_k<<<1, 1, 0, st_eng>>>(eng_flag_dev + li*kEngFlagStride, v.params + v.M*4 - 4);
             ck(cudaGetLastError(), "verify engram wait");
-            const int n16 = int(VerifyWorkspace::TB / 16);
-            engram_rows_k<<<(n16+255)/256, 256, 0, st_eng>>>((const uint4*)(v.veng_host_dev + li*VerifyWorkspace::TB),
-                                                            (uint4*)(v.veng + li*VerifyWorkspace::TB), n16);
+            const int n16 = int(v.TB / 16);
+            engram_rows_k<<<(n16+255)/256, 256, 0, st_eng>>>((const uint4*)(v.veng_host_dev + li*v.TB),
+                                                            (uint4*)(v.veng + li*v.TB), n16);
             ck(cudaGetLastError(), "verify engram rows");
-            const uint8_t* tw = v.veng + li*VerifyWorkspace::TB;
-            const uint8_t* ts = tw + size_t(VerifyWorkspace::M)*kEngRows*256;
+            const uint8_t* tw = v.veng + li*v.TB;
+            const uint8_t* ts = tw + size_t(v.M)*kEngRows*256;
             for (int t = 0; t < m; ++t)
                 ops::engram_dequant(tw + size_t(t)*cols*256, ts + size_t(t)*cols*8, cols, v.eng_vals+t*y.eng_wkv.k,
                                     st_eng);
             linear_on(v.eng_vals, y.eng_wkv,
-                      v.veng_kv + size_t(li)*VerifyWorkspace::M*(kHc+1)*kDim, v.act_eng, st_eng);
+                      v.veng_kv + size_t(li)*v.M*(kHc+1)*kDim, v.act_eng, st_eng);
             ck(cudaEventRecord(eng_join[li], st_eng), "verify engram join");
         }
     }
@@ -183,18 +193,23 @@ void Engine::Impl::enqueue_verify(int m) {
             copy(v.mix+t*kHc, one_hot_dev, kHc*sizeof(float));
         }
     }
+    };
     const bf16 *comp = stage.begin == 18 ? incoming_comp : nullptr, *keys = nullptr;
     int eng_i = 0;
-    for (int l = stage.begin; l < stage.end; ++l) {
+    auto layers=[&](int begin,int end) {
+    for (int l = begin; l < end; ++l) {
         auto& y = L[l]; auto& s = v.state[l];
+        int32_t* ids = v.routes+l*v.M*kTopK;
+        float* w = v.weights+l*v.M*kTopK;
+        auto attention_and_routes=[&] {
         // Formal rings and compressor tails stay unchanged until commit.
         copy(s.ring, y.window, kWindow*kHeadDim*sizeof(bf16));
         if (is_kv_source(l)) {
             const int capacity = max_seq/y.ratio+1;
-            if(owns_cache()) verify_tail_copy<<<(VerifyWorkspace::M*kHeadDim+255)/256,256,0,st>>>(
-                s.comp_backup, y.comp, v.params, kHeadDim, y.ratio, capacity, 0, false);
-            if(owns_cache()) verify_tail_copy<<<(VerifyWorkspace::M*kIndexDim+255)/256,256,0,st>>>(
-                s.key_backup, y.idx_keys, v.params, kIndexDim, y.ratio, capacity, 0, false);
+            if(owns_cache()) verify_tail_copy<<<(v.M*kHeadDim+255)/256,256,0,st>>>(
+                s.comp_backup, y.comp, v.params, kHeadDim, y.ratio, capacity, 0, false, v.M);
+            if(owns_cache()) verify_tail_copy<<<(v.M*kIndexDim+255)/256,256,0,st>>>(
+                s.key_backup, y.idx_keys, v.params, kIndexDim, y.ratio, capacity, 0, false, v.M);
             comp = y.comp; keys = y.idx_keys;
             if (y.ratio > 1) {
                 copy(s.kv, y.kv_state, 2*kHeadDim*sizeof(float));
@@ -203,8 +218,10 @@ void Engine::Impl::enqueue_verify(int m) {
         }
         if (is_engram_layer(l) && eng_i < n_eng) {
             ck(cudaStreamWaitEvent(st, eng_join[eng_i], 0), "verify engram join wait");
-            ops::engram_apply(v.h, v.veng_kv + size_t(eng_i)*VerifyWorkspace::M*(kHc+1)*kDim, y.eng_qw, y.eng_kw,
-                              kNormEps, m, st);
+            if(experimental_29()) ops::engram_apply_f32(v.h,v.veng_kv+size_t(eng_i)*v.M*(kHc+1)*kDim,
+                                                       y.eng_qw_f32,y.eng_kw_f32,kNormEps,m,st);
+            else ops::engram_apply(v.h, v.veng_kv + size_t(eng_i)*v.M*(kHc+1)*kDim, y.eng_qw, y.eng_kw,
+                                   kNormEps, m, st);
             ++eng_i;
         }
         if (ds) dspark_capture(l, v.h, m, ds_verify_mh(), st);
@@ -239,13 +256,13 @@ void Engine::Impl::enqueue_verify(int m) {
             bool have_latent = false;
             if (is_kv_source(l)) {
                 if (y.ratio == 1) {
-                    ops::bf16_linear(x, nullptr, y.c_wkv, kDim, kHeadDim, latent, nullptr, st);
+                    small_linear(x,y.c_wkv,y.c_wkv_exl3,kDim,kHeadDim,latent,nullptr,st);
                     ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st);
                     have_latent = true;
                 } else {
                     const int slot = (parity+t)&1;
-                    ops::bf16_linear(x, nullptr, y.c_wkv, kDim, kHeadDim, nullptr, s.kv+slot*kHeadDim, st);
-                    ops::bf16_linear(x, nullptr, y.c_wgate, kDim, kHeadDim, nullptr, s.score+slot*kHeadDim, st);
+                    small_linear(x,y.c_wkv,y.c_wkv_exl3,kDim,kHeadDim,nullptr,s.kv+slot*kHeadDim,st);
+                    small_linear(x,y.c_wgate,y.c_wgate_exl3,kDim,kHeadDim,nullptr,s.score+slot*kHeadDim,st);
                     if (slot == 1) {
                         ops::compress_pool(s.kv, s.score, 2, latent, 1, st);
                         ops::rmsnorm(latent, y.c_norm, latent, kHeadDim, kNormEps, 1, st);
@@ -257,7 +274,7 @@ void Engine::Impl::enqueue_verify(int m) {
             }
             if (is_index_source(l)) {
                 if (have_latent) {
-                    ops::bf16_linear(latent, nullptr, y.idx_wk, kHeadDim, kIndexDim, ik, nullptr, st);
+                    small_linear(latent,y.idx_wk,y.idx_wk_exl3,kHeadDim,kIndexDim,ik,nullptr,st);
                     ops::rmsnorm(ik, y.idx_knorm, ik, kIndexDim, kNormEps, 1, st);
                     ops::rope_device(ik, 1, kIndexDim, rope_yarn, p+1, 1-y.ratio, false, st);
                     ops::fp4_quant_inplace(ik, kIndexDim, 32, false, st);
@@ -267,7 +284,8 @@ void Engine::Impl::enqueue_verify(int m) {
                 fp8_linear(v.qr+t*kQLora, y.idx_wq_b, iq);
                 ops::rope_device(iq, kIndexHeads, kIndexDim, rope_yarn, p+1, 0, false, st);
                 ops::fp4_quant_inplace(iq, kIndexHeads*kIndexDim, 32, false, st);
-                ops::bf16_linear(x, nullptr, y.idx_wp, kDim, kIndexHeads, iw_raw, nullptr, st);
+                if(y.idx_wp_f16) fp16_weight_linear(x,y.idx_wp_f16,1,kDim,kIndexHeads,iw_raw,nullptr,st);
+                else ops::bf16_linear(x, nullptr, y.idx_wp, kDim, kIndexHeads, iw_raw, nullptr, st);
                 ops::scale_bf16(iw_raw, float(std::pow(kIndexDim,-0.5)*std::pow(kIndexHeads,-0.5)), iw, kIndexHeads, st);
                 const int64_t cap = y.ratio == 1 ? tcap1 : tcap2;
                 kernels::indexer_topk_device(iq, keys, p+1, y.ratio, cap, iw, l > kCandidateLayer ? cand : nullptr,
@@ -296,6 +314,10 @@ void Engine::Impl::enqueue_verify(int m) {
                 ops::wo_a_grouped(ot, y.wo_a, v.oa+t*kOGroups*kOLora, st);
         }
         if (y.wo_a_exl3[tensor?tensor_rank*(kOGroups/2):0].trellis)
+          if (batch_projections_)
+            exl3_projection_batch(v.o,y.wo_a_exl3.data(),v.oa,kOGroups,m,
+                kHeads*kHeadDim,kOGroups*kOLora,v.dense,v.dense_bytes,st);
+          else
             for (int group = 0; group < kOGroups; ++group)
                 if(!tensor || group/(kOGroups/2)==tensor_rank)
                     projection(v.o + group*(kHeads*kHeadDim/kOGroups),y.wo_a_exl3[group],
@@ -308,11 +330,40 @@ void Engine::Impl::enqueue_verify(int m) {
         kernels::hc_mixes_pre(v.h2, m, y.hc_ffn_fn, y.hc_ffn_scale, y.hc_ffn_base, v.apre,
                              v.xf, v.fpre, v.fpost, v.fcomb, st);
         ops::rmsnorm(v.xf, y.ffn_norm, v.xf, kDim, kNormEps, m, st);
-        int32_t* ids = v.routes+l*VerifyWorkspace::M*kTopK;
-        float* w = v.weights+l*VerifyWorkspace::M*kTopK;
-        kernels::router_topk(v.xf, m, y.gate_w, y.gate_bias, ids, w, st);
+        if(y.gate_f16) {
+            fp16_weight_linear(v.xf,y.gate_f16,m,kDim,kExperts,nullptr,v.act,st);
+            prefill::route_rows(v.act,y.gate_bias,m,ids,w,st);
+        } else kernels::router_topk(v.xf, m, y.gate_w, y.gate_bias, ids, w, st);
         if (pack.has_exl3_dense()) exl3_input_half(v.xf, v.half, m*kDim, st);
         else ops::to_half_fp8q(v.xf, v.half, m*kDim, st);
+        };
+        // The static prefix owns its own capture. Only cold-tail layers enter
+        // this graph; route admission and cache replacement remain eager.
+        if(verify_layer_graphs_ && v.warmed && l>=static_prefix_end_) {
+            const std::array<int64_t,5> key{l,m,parity,tcap1,tcap2};
+            auto found=v.layer_graphs.find(key);
+            if(found==v.layer_graphs.end() && v.layer_graphs.size()<256) {
+                ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"verify layer capture");
+                cudaGraph_t graph=nullptr;cudaGraphExec_t exec=nullptr;
+                try {
+                    attention_and_routes();
+                    ck(cudaStreamEndCapture(st,&graph),"verify layer capture end");
+                    ck(cudaGraphInstantiate(&exec,graph,0),"verify layer instantiate");
+                } catch(...) {
+                    if(!graph) cudaStreamEndCapture(st,&graph);
+                    if(graph) cudaGraphDestroy(graph);
+                    throw;
+                }
+                cudaGraphDestroy(graph);
+                try { found=v.layer_graphs.emplace(key,VerifyWorkspace::PrefixGraph{exec,comp,keys,eng_i}).first; }
+                catch(...) { cudaGraphExecDestroy(exec);throw; }
+                ++v.prefix_captures;
+            }
+            if(found!=v.layer_graphs.end()) {
+                ck(cudaGraphLaunch(found->second.exec,st),"verify layer replay");++v.prefix_replays;
+                comp=found->second.comp;keys=found->second.keys;eng_i=found->second.engrams;
+            } else attention_and_routes();
+        } else attention_and_routes();
         const bool tier = vram && vram->slots() > 0;
         const auto* ram = host && host->experts_dev() ? host->experts_dev()+size_t(l)*kExperts : nullptr;
         // prefetch, as the step: layer l's guesses (all rows' union) were planned and copied during layer l - 1
@@ -320,10 +371,10 @@ void Engine::Impl::enqueue_verify(int m) {
         // CPU, and the host thread then holds the driver while the DMA copy thread needs it for the copies the GPU
         // waits for (a hang at layer 5, laptop); a graph is one launch
         const bool pf = prefetch && ram && zc_blobs && !v.eager;
-        if (resident_backend()) {
+        if (resident_backend() && !experimental_29()) {
             for (int t = 0; t < m; ++t)
                 ops::resident_routes(ids+t*kTopK, vram->res_dev()+size_t(l)*kExperts, v.selected+t*kTopK, st);
-        } else v.db->publish(v.half, ids, w, m, tier ? vram->res_dev()+size_t(l)*kExperts : nullptr, v.selected,
+        } else if(!resident_backend()) v.db->publish(v.half, ids, w, m, tier ? vram->res_dev()+size_t(l)*kExperts : nullptr, v.selected,
                       l+1, st, tier ? vram->experts_dev() : nullptr, ram, zc_quota ? zc_quota.get()+l : nullptr,
                       nullptr, nullptr, pf && l > 0 ? prefetch->ids(l) : nullptr,
                       pf && l > 0 ? prefetch->descs(l) : nullptr, pf ? ExpertPrefetch::kMaxGuesses : 0, tail_rank, ssd_rank);
@@ -331,9 +382,20 @@ void Engine::Impl::enqueue_verify(int m) {
             prefetch->plan_rows(l+1, v.xf, m, L[l+1].gate_w, L[l+1].gate_bias,
                                 tier ? vram->res_dev()+size_t(l+1)*kExperts : nullptr,
                                 host->experts_dev()+size_t(l+1)*kExperts, zc_blobs.get()+size_t(l+1)*kExperts, st);
+        // Drain a submitted read on every unwind before its pinned buffer can
+        // be reused or destroyed. It never changes cache state until finish.
+        struct CachedReadGuard {
+            VramExperts* tier = nullptr;
+            ~CachedReadGuard() { if(tier) tier->cancel_cached_rows(); }
+            bool finish() { const bool hit=tier->finish_cached_rows();tier=nullptr;return hit; }
+        } cached_read;
         // the shared expert reads xf only: on st_sh beside the routed experts until the outputs add up
         ck(cudaEventRecord(sh_fork, st), "verify shared fork");
         ck(cudaStreamWaitEvent(st_sh, sh_fork, 0), "verify shared fork wait");
+        if(experimental_29() && async_cached_rows_ && !vram->fully_resident_layer(l)) {
+            vram->begin_cached_rows(l,ids,m,kTopK,v.selected,st);
+            cached_read.tier=vram.get();
+        }
         linear_on(v.xf, y.sh_w1, v.g, v.act_sh, st_sh);
         linear_on(v.xf, y.sh_w3, v.u, v.act_sh, st_sh);
         ops::swiglu(v.g, v.u, kSwigluLimit, v.sh_h, m*kMoeInter, st_sh);
@@ -341,7 +403,23 @@ void Engine::Impl::enqueue_verify(int m) {
         ck(cudaEventRecord(sh_done, st_sh), "verify shared done");
         ck(cudaMemsetAsync(v.routed, 0, m*kDim*sizeof(float), st), "verify routed");
         if (pf && l > 0) prefetch->join(l, st);   // the GPU computes the prefetched experts below
-        if(tensor) {
+        if(experimental_29()) {
+            if(vram->fully_resident_layer(l)) {
+                for(int t=0;t<m;++t) vram->prepare_decode(l,ids+t*kTopK,kTopK,v.selected+t*kTopK,st,true);
+                kernels::exl3_moe_decode(reinterpret_cast<const half*>(v.half),m,v.selected,w,kTopK,
+                    vram->experts_dev(),v.routed,vram->workspace(),VramExperts::kWorkspaceBytes,st,rate_hints_[l]);
+            } else if(cached_rows_ && (cached_read.tier ? cached_read.finish() :
+                                       vram->try_cached_rows(l,ids,m,kTopK,v.selected,st))) {
+                kernels::exl3_moe_decode(reinterpret_cast<const half*>(v.half),m,v.selected,w,kTopK,
+                    vram->experts_dev(),v.routed,vram->workspace(),VramExperts::kWorkspaceBytes,st,rate_hints_[l]);
+            } else for(int t=0;t<m;++t) {
+                // The next preparation fences this row's consumer before an
+                // upload slot or cached descriptor can be overwritten.
+                vram->prepare_decode(l,ids+t*kTopK,kTopK,v.selected+t*kTopK,st);
+                kernels::exl3_moe_decode(reinterpret_cast<const half*>(v.half)+size_t(t)*kDim,1,v.selected+t*kTopK,
+                    w+t*kTopK,kTopK,vram->experts_dev(),v.routed+size_t(t)*kDim,vram->workspace(),VramExperts::kWorkspaceBytes,st,rate_hints_[l]);
+            }
+        } else if(tensor) {
             kernels::exl3_moe_tensor_up(reinterpret_cast<const __half*>(v.half),m,v.selected,w,kTopK,
                                         vram->experts_dev(),vram->workspace(),VramExperts::kWorkspaceBytes,tensor_rank,st);
             tensor->gather(tensor_rank,768+2*l,kernels::exl3_moe_tensor_hidden(vram->workspace(),m,kTopK),
@@ -352,7 +430,8 @@ void Engine::Impl::enqueue_verify(int m) {
         } else if (tier || ram)
             kernels::exl3_moe_decode((const __half*)v.half, m, v.selected, w, kTopK,
                                     resident_backend() ? vram->experts_dev() : v.db->gpu_experts(), v.routed,
-                                    vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+                                    vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st,
+                                    rate_hints_[l]);
         if (!resident_backend()) v.db->wait_add(v.routed, m, l+1, st);
         if (pf && l+1 < kLayers) prefetch->ready(l+1, st);   // the next layer overwrites v.xf, which the guesses read
         ck(cudaStreamWaitEvent(st, sh_done, 0), "verify shared join");
@@ -360,6 +439,34 @@ void Engine::Impl::enqueue_verify(int m) {
         ops::hc_post(v.ffn_out, v.h2, v.fpost, v.fcomb, v.h, m, st);
         copy(v.mix, v.fpre, m*kHc*sizeof(float));
     }
+    };
+    int begin=stage.begin;
+    if(static_graphs_ && v.warmed && static_prefix_end_>stage.begin) {
+        const std::array<int64_t,4> key{m,parity,tcap1,tcap2};
+        auto found=v.prefix_graphs.find(key);
+        if(found==v.prefix_graphs.end()) {
+            ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"verify prefix capture");
+            cudaGraph_t graph=nullptr;cudaGraphExec_t exec=nullptr;
+            try {
+                verify_head();layers(stage.begin,static_prefix_end_);
+                for(int li=0;li<n_eng;++li) ck(cudaStreamWaitEvent(st,eng_join[li],0),"verify prefix side join");
+                ck(cudaStreamEndCapture(st,&graph),"verify prefix end capture");
+                ck(cudaGraphInstantiate(&exec,graph,0),"verify prefix instantiate");
+            } catch(...) {
+                if(!graph) cudaStreamEndCapture(st,&graph);
+                if(graph) cudaGraphDestroy(graph);
+                throw;
+            }
+            cudaGraphDestroy(graph);
+            try { found=v.prefix_graphs.emplace(key,VerifyWorkspace::PrefixGraph{exec,comp,keys,eng_i}).first; }
+            catch(...) { cudaGraphExecDestroy(exec);throw; }
+            ++v.prefix_captures;
+        }
+        ck(cudaGraphLaunch(found->second.exec,st),"verify prefix replay");++v.prefix_replays;
+        comp=found->second.comp;keys=found->second.keys;eng_i=found->second.engrams;
+        begin=static_prefix_end_;
+    } else verify_head();
+    layers(begin,stage.end);
     if (stage.end != kLayers) return;
     ops::hc_pre(v.h, v.mix, v.final_x, m, st);
     ops::rmsnorm(v.final_x, final_norm, v.final_x, kDim, kNormEps, m, st);
@@ -369,7 +476,7 @@ void Engine::Impl::enqueue_verify(int m) {
     for (int t = 0; t < m; ++t) ops::argmax_logits(v.logits+t*kVocab, v.next+t, st);
     ck(cudaMemcpyAsync(v.next_host, v.next, m*sizeof(int), cudaMemcpyDeviceToHost, st), "verify next");
     ck(cudaMemcpyAsync(v.logits_host, v.logits, size_t(m)*kVocab*sizeof(float), cudaMemcpyDeviceToHost, st), "verify logits");
-    ck(cudaMemcpyAsync(v.routes_host, v.routes, kLayers*VerifyWorkspace::M*kTopK*sizeof(int32_t), cudaMemcpyDeviceToHost, st), "verify routes");
+    ck(cudaMemcpyAsync(v.routes_host, v.routes, kLayers*v.M*kTopK*sizeof(int32_t), cudaMemcpyDeviceToHost, st), "verify routes");
 }
 
 VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool want_logits, Timing& tm) {
@@ -377,7 +484,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     usable();
     if (verify_pending) throw std::logic_error("commit the pending verify window first");
     const int m = int(window.size());
-    if (m < 1 || m > kVerifyMaxTokens) throw std::invalid_argument("verify supports 1..4 rows on the CPU path");
+    if (m < 1 || m > verify_rows_) throw std::invalid_argument("verify window exceeds configured capacity");
     if (pos < 0 || pos != int(history.size()) || pos > max_seq-m)
         throw std::invalid_argument("verify position is not the committed position or exceeds max_seq");
     for (int token : window)
@@ -387,6 +494,12 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     v.tokens = window; v.pos = pos; v.m = m;
     tm = Timing{};
     const double begin = now_ms();
+    const int64_t streamed_before=vram?vram->streamed_decode_experts():0;
+    const int64_t ram_hits_before=vram?vram->ram_cache_hits():0;
+    const uint64_t ram_bytes_before=vram?vram->ram_cache_read_bytes():0;
+    const int64_t cached_batches_before=vram?vram->cached_row_batches():0;
+    const int64_t async_reads_before=vram?vram->async_cached_row_reads():0;
+    const int prefix_captures_before=v.prefix_captures,prefix_replays_before=v.prefix_replays;
     // Stage hashes from each tentative prefix; the rows of all tokens are read beside the first layers.
     const int cols = n_eng ? (pack.engram_hash().max_ngram-1)*pack.engram_hash().n_heads : 0;
     try {
@@ -406,7 +519,7 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
     history.resize(pos);
     if (n_eng) {
         v.job.rows = m*cols;
-        v.params_host[VerifyWorkspace::M*4] = int(post_engram(v.job));
+        v.params_host[v.M*4] = int(post_engram(v.job));
     }
     if (vram) tm.vram_swaps = vram->between_steps();
     parity = pos&1;
@@ -490,7 +603,17 @@ VerifyResult Engine::Impl::verify(const std::vector<int>& window, int pos, bool 
         }
     }
     tm.expert_total = m*(stage.end-stage.begin)*kTopK;
+    tm.static_graph_captures=v.prefix_captures-prefix_captures_before;
+    tm.static_graph_replays=v.prefix_replays-prefix_replays_before;
     tm.expert_hits = tm.expert_total - worker_misses.load();
+    if(experimental_29()) {
+        tm.streamed_experts=int(vram->streamed_decode_experts()-streamed_before);
+        tm.expert_hits-=tm.streamed_experts;
+        tm.ram_cached_uploads=int(vram->ram_cache_hits()-ram_hits_before);
+        tm.ram_cache_read_bytes=vram->ram_cache_read_bytes()-ram_bytes_before;
+        tm.cached_row_batches=int(vram->cached_row_batches()-cached_batches_before);
+        tm.async_cached_row_reads=int(vram->async_cached_row_reads()-async_reads_before);
+    }
     tm.ram_experts = worker_ram.load();
     tm.file_experts = worker_file.load();
     tm.ssd_experts = worker_ssd.load();
@@ -538,10 +661,10 @@ void Engine::Impl::commit_verify(int keep) {
         }
         // Restore the original bytes of every rejected append. Accepted appends are now visible.
         const int capacity = max_seq/y.ratio+1;
-        if(owns_cache()) verify_tail_copy<<<(VerifyWorkspace::M*kHeadDim+255)/256,256,0,st>>>(
-            s.comp_backup, y.comp, v.params, kHeadDim, y.ratio, capacity, keep, true);
-        if(owns_cache()) verify_tail_copy<<<(VerifyWorkspace::M*kIndexDim+255)/256,256,0,st>>>(
-            s.key_backup, y.idx_keys, v.params, kIndexDim, y.ratio, capacity, keep, true);
+        if(owns_cache()) verify_tail_copy<<<(v.M*kHeadDim+255)/256,256,0,st>>>(
+            s.comp_backup, y.comp, v.params, kHeadDim, y.ratio, capacity, keep, true, v.M);
+        if(owns_cache()) verify_tail_copy<<<(v.M*kIndexDim+255)/256,256,0,st>>>(
+            s.key_backup, y.idx_keys, v.params, kIndexDim, y.ratio, capacity, keep, true, v.M);
     }
     ck(cudaStreamSynchronize(st), "verify commit");
     for (int t = 0; t < keep; ++t) history.push_back(pack.engram_hash().token_map[v.tokens[t]]);
@@ -551,7 +674,7 @@ void Engine::Impl::commit_verify(int keep) {
         int32_t row[kLayers*kTopK];
         for (int t = 0; t < keep; ++t) {
             for (int l = 0; l < kLayers; ++l)
-                std::copy_n(v.routes_host+(l*VerifyWorkspace::M+t)*kTopK, kTopK, row+l*kTopK);
+                std::copy_n(v.routes_host+(l*v.M+t)*kTopK, kTopK, row+l*kTopK);
             if (vram) vram->count(row, kTopK);
             if (host && host->reserve() > 0) host->end_step(row, kTopK);   // publish the window's reads, record uses
         }
@@ -561,11 +684,15 @@ void Engine::Impl::commit_verify(int keep) {
     verify_failed = false;
 }
 
+int Engine::verify_capacity() const { return impl_->verify_rows_; }
+
 VerifyResult Engine::verify(const std::vector<int>& window, int pos, bool logits) {
+    if (impl_->experimental_29() && !impl_->experimental_verify_)
+        throw std::invalid_argument("experimental 2.9 profile has not qualified speculative verification");
     if (tail_) {
         impl_->usable(); tail_->usable();
         if (split_verify_pending_) throw std::logic_error("commit the pending split verify window first");
-        if (window.empty() || window.size() > kVerifyMaxTokens || pos != position() ||
+        if (window.empty() || window.size() > size_t(verify_capacity()) || pos != position() ||
             pos < 0 || window.size() > size_t(impl_->max_seq - pos))
             throw std::invalid_argument("split verify: invalid window/position");
         for (int token : window) Impl::check_token(token);
@@ -591,6 +718,7 @@ VerifyResult Engine::verify(const std::vector<int>& window, int pos, bool logits
                 tail_->verify_ws = std::make_shared<Impl::VerifyWorkspace>(*tail_);
             }
             auto& a = *impl_->verify_ws; auto& b = *tail_->verify_ws;
+            const auto handoff_before = impl_->handoff->stats();
             auto transfer = [&](void* dst, const void* src, size_t bytes) {
                 constexpr size_t bound = kHc*kDim*sizeof(bf16);
                 for (size_t off=0; off<bytes; off+=bound)
@@ -598,25 +726,46 @@ VerifyResult Engine::verify(const std::vector<int>& window, int pos, bool logits
                                          std::min(bound,bytes-off), impl_->st,tail_->st);
             };
             const int m = int(window.size());
-            transfer(b.h,a.h,size_t(m)*kHc*kDim*sizeof(bf16));
-            transfer(b.mix,a.mix,size_t(m)*kHc*sizeof(float));
+            std::array<StageTransfer::Buffer, kVerifyMaxResidentTokens + 3> buffers{};
+            size_t buffer_count = 0;
+            auto send = [&](void* dst, const void* src, size_t bytes) {
+                if (impl_->verify_bulk_handoff_) {
+                    if (buffer_count == buffers.size()) throw std::logic_error("verify handoff buffer bound");
+                    buffers[buffer_count++] = {dst, src, bytes};
+                } else transfer(dst, src, bytes);
+            };
+            send(b.h,a.h,size_t(m)*kHc*kDim*sizeof(bf16));
+            send(b.mix,a.mix,size_t(m)*kHc*sizeof(float));
             if (tail_->stage.begin == 18) {
                 DeviceScope scope(tail_->stage.device);
                 const int params[] = {0,pos};
                 ck(cudaMemcpyAsync(b.params,params,sizeof(params),cudaMemcpyHostToDevice,tail_->st),"verify mirror position");
-                verify_tail_copy<<<(Impl::VerifyWorkspace::M*kHeadDim+255)/256,256,0,tail_->st>>>(
-                    b.incoming_backup,tail_->incoming_comp,b.params,kHeadDim,2,tail_->max_seq/2+1,0,false);
+                verify_tail_copy<<<(b.M*kHeadDim+255)/256,256,0,tail_->st>>>(
+                    b.incoming_backup,tail_->incoming_comp,b.params,kHeadDim,2,tail_->max_seq/2+1,0,false,b.M);
                 ck(cudaStreamSynchronize(tail_->st),"verify mirror backup");
                 const size_t first=size_t(pos/2)*kHeadDim, rows=size_t((pos+m)/2-pos/2);
-                if (rows) transfer(tail_->incoming_comp+first,impl_->L[14].comp+first,rows*kHeadDim*sizeof(bf16));
+                if (rows) send(tail_->incoming_comp+first,impl_->L[14].comp+first,rows*kHeadDim*sizeof(bf16));
                 for (int t=0;t<m;++t)
-                    transfer(b.indices+t*(kWindow+kIndexTopK)+kWindow,a.indices+t*(kWindow+kIndexTopK)+kWindow,
-                             kIndexTopK*sizeof(int32_t));
+                    send(b.indices+t*(kWindow+kIndexTopK)+kWindow,a.indices+t*(kWindow+kIndexTopK)+kWindow,
+                         kIndexTopK*sizeof(int32_t));
             }
+            if (impl_->verify_bulk_handoff_)
+                impl_->handoff->copy_group(buffers.data(),buffer_count,impl_->st,tail_->st);
             result = tail_->verify(window,pos,logits,last);
             split_verify_tokens_ = window;
             split_verify_pending_ = true;
             timing_=first; timing_.expert_hits+=last.expert_hits; timing_.expert_total+=last.expert_total;
+            timing_.streamed_experts+=last.streamed_experts;
+            timing_.ram_cached_uploads+=last.ram_cached_uploads;
+            timing_.cached_row_batches+=last.cached_row_batches;
+            timing_.async_cached_row_reads+=last.async_cached_row_reads;
+            timing_.ram_cache_read_bytes+=last.ram_cache_read_bytes;
+            timing_.static_graph_captures+=last.static_graph_captures;
+            timing_.static_graph_replays+=last.static_graph_replays;
+            const auto& handoff_after = impl_->handoff->stats();
+            timing_.verify_handoff_groups = handoff_after.groups - handoff_before.groups;
+            timing_.verify_handoff_copies = handoff_after.copy_calls - handoff_before.copy_calls;
+            timing_.verify_handoff_host_waits = handoff_after.host_waits - handoff_before.host_waits;
             timing_.engram_ms+=last.engram_ms; timing_.total_ms=timing_.gpu_ms=now_ms()-start;
             return result;
         } catch (...) {
@@ -640,8 +789,8 @@ void Engine::commit(int n_keep) {
             if (!tensor_ && tail_->stage.begin==18) {
                 DeviceScope scope(tail_->stage.device);
                 auto& v=*tail_->verify_ws;
-                verify_tail_copy<<<(Impl::VerifyWorkspace::M*kHeadDim+255)/256,256,0,tail_->st>>>(
-                    v.incoming_backup,tail_->incoming_comp,v.params,kHeadDim,2,tail_->max_seq/2+1,n_keep,true);
+                verify_tail_copy<<<(v.M*kHeadDim+255)/256,256,0,tail_->st>>>(
+                    v.incoming_backup,tail_->incoming_comp,v.params,kHeadDim,2,tail_->max_seq/2+1,n_keep,true,v.M);
                 ck(cudaStreamSynchronize(tail_->st),"verify mirror commit");
             }
             total.total_ms += now_ms() - start; total.gpu_ms = total.total_ms;

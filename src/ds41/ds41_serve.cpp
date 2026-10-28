@@ -451,10 +451,10 @@ int main(int argc, char** argv) {
                         tok = predicted.front(); predicted.pop_front();
                         continue;
                     }
-                    const int limit = int(std::min<long long>({kVerifyMaxTokens, r.max_new - d.generated,
+                    const int limit = int(std::min<long long>({e.verify_capacity(), r.max_new - d.generated,
                                                                 o.max_context - e.position()}));
                     if (r.greedy() && o.spec != "none" && limit > 1) {
-                        int32_t drafts[kVerifyMaxTokens]{};
+                        int32_t drafts[kVerifyMaxResidentTokens]{};
                         int proposed = 0;
                         if (o.spec == "dspark") {
                             const auto draft = e.draft(tok);

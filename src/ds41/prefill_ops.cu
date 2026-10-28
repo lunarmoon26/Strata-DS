@@ -189,8 +189,8 @@ void rope_rows(bf16* v, int rows, int n_vec, int stride, const float* table, int
     LAUNCH_CHECK("rope_rows");
 }
 
-void route_rows(const float* logits, const float* bias, int rows, int32_t* ids, float* weights) {
-    if (rows > 0) route_rows_k<<<grid(rows, 8), 256>>>(logits, bias, rows, ids, weights);
+void route_rows(const float* logits, const float* bias, int rows, int32_t* ids, float* weights, cudaStream_t stream) {
+    if (rows > 0) route_rows_k<<<grid(rows, 8), 256, 0, stream>>>(logits, bias, rows, ids, weights);
     LAUNCH_CHECK("route_rows");
 }
 

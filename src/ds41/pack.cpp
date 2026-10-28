@@ -110,7 +110,8 @@ namespace {
 bool tensor_replicated_projection(const std::string& name) {
     return name.compare(0,7,"layers.")==0 &&
         (name.find(".attn.wq_a")!=std::string::npos || name.find(".attn.wkv")!=std::string::npos ||
-         name.find(".ffn.shared_experts.")!=std::string::npos);
+         name.find(".ffn.shared_experts.")!=std::string::npos ||
+         name.find(".attn.compressor.")!=std::string::npos || name.find(".attn.indexer.wk")!=std::string::npos);
 }
 int tensor_group_owner(const std::string& name) {
     const std::string key=".attn.wo_a.slice.";
@@ -130,7 +131,7 @@ kernels::Exl3Proj Pack::exl3_projection(const std::string& name, int k, int n) c
     const auto& m = dense(name + ".mul1");
     if (k <= 0 || n <= 0 || k % 128 || n % 128 || t.dtype != DType::I16 ||
         t.shape.size() != 3 || t.shape[0] != k / 16 || t.shape[1] != n / 16 ||
-        t.shape[2] < 16 || t.shape[2] > 96 || t.shape[2] % 16 ||
+        t.shape[2] < 16 || t.shape[2] > (experimental_29_ ? 128 : 96) || t.shape[2] % 16 ||
         t.bytes != uint64_t(k / 16) * (n / 16) * t.shape[2] * 2 ||
         u.dtype != DType::F16 || u.shape != std::vector<int64_t>{k} || u.bytes != uint64_t(k) * 2 ||
         v.dtype != DType::F16 || v.shape != std::vector<int64_t>{n} || v.bytes != uint64_t(n) * 2 ||
@@ -169,7 +170,15 @@ Pack::Pack(const std::string& dir) : dir_(dir) {
         while (std::getline(f, line)) {
             std::istringstream s(line);
             long long v = 0;
-            s >> key >> v;
+            s >> key;
+            if (key == "profile") {
+                std::string profile;
+                s >> profile;
+                if (profile != "libertaidai-29") fail("unknown experimental pack profile");
+                experimental_29_ = true;
+                continue;
+            }
+            s >> v;
             if (key == "finished") finished = v == 1;
             if (key == "layers") n_layers_ = (int) v;
             if (key == "experts") n_experts_ = (int) v;

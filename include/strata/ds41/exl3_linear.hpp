@@ -8,6 +8,12 @@ namespace strata::ds41 {
 /// Small speculative windows use native GEMV jobs over shared quantized weights,
 /// not reconstruction of a full FP16 matrix. Strides preserve grouped outputs.
 size_t exl3_small_rows_workspace_bytes(int rows, int k, int n);
+// Batch 1..16 equal-shape/rate projections laid side by side within each row.
+// Descriptors are host-resident and copied by value into kernel arguments.
+size_t exl3_projection_batch_workspace_bytes(int count, int rows, int k, int n);
+void exl3_projection_batch(const __nv_bfloat16* x, const kernels::Exl3Proj* weights,
+                           __nv_bfloat16* y, int count, int rows, int xs, int ys,
+                           void* workspace, size_t bytes, cudaStream_t stream);
 void exl3_linear_small_rows(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
                             __nv_bfloat16* y, float* logits, int rows, int xs, int ys,
                             void* workspace, size_t bytes, cudaStream_t stream);
@@ -18,12 +24,12 @@ void exl3_linear_small_rows(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
 size_t exl3_linear_workspace_bytes(int k, int n);
 void exl3_linear(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
                  __nv_bfloat16* y, float* logits, void* workspace,
-                 size_t workspace_bytes, cudaStream_t stream);
+                  size_t workspace_bytes, cudaStream_t stream, bool raw_float = false);
 void exl3_input_half(const __nv_bfloat16* x, uint16_t* y, int n, cudaStream_t stream);
 size_t exl3_rows_workspace_bytes(int rows, int k, int n);
 // Bounded temporary reconstruction of one matrix, reused across rows; not a cache.
 void exl3_linear_rows(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
                       __nv_bfloat16* y, int rows, int input_stride, int output_stride,
-                      void* workspace, size_t bytes, cudaStream_t stream);
+                       void* workspace, size_t bytes, cudaStream_t stream, float* raw_float = nullptr);
 
 }  // namespace strata::ds41

@@ -113,7 +113,7 @@ def dequant_wo_a(w_bytes, w_shape, s_bytes, s_shape):
     return bytearray(w.flatten(2, 3).flatten(0, 1).bfloat16().contiguous().view(torch.uint8).numpy().tobytes())
 
 
-def validate_exl3_dense(srcs):
+def validate_exl3_dense(srcs, profile=None):
     """Validate stored full-EXL3 linears; do not reconstruct or change scales."""
     count = 0
     for name in sorted(srcs.entries):
@@ -122,7 +122,7 @@ def validate_exl3_dense(srcs):
         stem = name[:-len(".trellis")]
         _, dtype, shape, _, size = srcs.entries[name]
         if (dtype != "I16" or len(shape) != 3 or shape[0] <= 0 or shape[1] <= 0
-                or shape[0] % 8 or shape[1] % 8 or shape[2] not in range(16, 97, 16)
+                or shape[0] % 8 or shape[1] % 8 or shape[2] not in range(16, 129 if profile == "libertaidai-29" else 97, 16)
                 or size != shape[0] * shape[1] * shape[2] * 2):
             raise ValueError(f"{name}: unsupported EXL3 dense geometry")
         for part, dims, dt in (("suh", [shape[0] * 16], "F16"),
@@ -137,10 +137,10 @@ def validate_exl3_dense(srcs):
     return count
 
 
-def write_dense(srcs, out, wo_a_fp8=True):
+def write_dense(srcs, out, wo_a_fp8=True, profile=None):
     """wo_a_fp8: keep attn.wo_a as FP8 E4M3 with its E8M0 block scales (the engine dequantizes it on the fly, to the
     same BF16 values); else dequantize it to BF16 here, as inference/convert.py does."""
-    exl3 = validate_exl3_dense(srcs)
+    exl3 = validate_exl3_dense(srcs, profile)
     if exl3 and not wo_a_fp8:
         raise ValueError("EXL3 dense packs cannot use --wo-a-bf16")
     names = sorted(n for n in srcs.entries
@@ -237,7 +237,7 @@ def read_experts_txt(path):
     return rows
 
 
-def write_engram(src, out):
+def write_engram(src, out, profile=None):
     """The Engram tables stay in their files: engrams/*.safetensors (the 3bpw pack) or the index's shards that hold
     them (SAGE 1.59bpw)."""
     paths = []
@@ -246,6 +246,13 @@ def write_engram(src, out):
         paths += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".safetensors")]
     idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
     paths += [os.path.join(src, f) for f in sorted({f for k, f in idx.items() if k.endswith(".engram.embed.weight")})]
+    if profile == "libertaidai-29":
+        for name in ("model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors"):
+            path = os.path.join(src, name)
+            if not os.path.isfile(path):
+                raise ValueError("libertaidai-29 requires the original 1017 Engram shards beside the checkpoint")
+            if path not in paths:
+                paths.append(path)
     tables = {}
     for path in map(os.path.abspath, paths):
         if "\n" in path or "\r" in path:
@@ -402,21 +409,32 @@ def add_mtp_experts(src, out, n_stages=3, n_experts=128):
     return n_stages * n_experts
 
 
-def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=False, engram_from=None):
+def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=False, engram_from=None, profile=None):
     """dense_only: rewrite dense.bin and index.txt of a finished pack; experts.bin and the rest stay."""
     if engram_from is not None and not wo_a_fp8:
         raise SystemExit("--engram-from cannot use --wo-a-bf16 (that conversion needs torch)")
+    if profile not in (None, "libertaidai-29"):
+        raise ValueError("unsupported experimental pack profile")
+    if profile:
+        if dense_only or not wo_a_fp8 or n_layers != 40 or n_experts != 384:
+            raise ValueError("libertaidai-29 requires a new 40-layer, 384-expert lossless pack")
+        cfg = json.load(open(os.path.join(src, "config.json")))
+        q = cfg.get("quantization_config", {})
+        if q.get("quant_method") != "exl3" or q.get("avg_bits") != 2.9 or q.get("codebook") != "mul1":
+            raise ValueError("libertaidai-29 requires the published 2.9-bpw mul1 EXL3 profile")
     os.makedirs(out, exist_ok=True)
     info = os.path.join(out, "pack_info.txt")
     old = {}
     if dense_only:
         old = dict(l.split(None, 1) for l in open(info).read().splitlines() if l.strip())
+        if "profile" in old:
+            raise ValueError("--dense-only cannot rewrite an experimental pack or remove its profile gate")
         if old.get("finished", "").strip() != "1":
             raise SystemExit("--dense-only needs a finished pack")
     if os.path.exists(info):
         os.remove(info)                  # an old marker must not vouch for a new, half-written pack
     srcs = Source(src)
-    n_dense, dense_bytes = write_dense(srcs, out, wo_a_fp8)
+    n_dense, dense_bytes = write_dense(srcs, out, wo_a_fp8, profile)
     if dense_only:
         with open(info, "w") as f:
             f.write(f"source {os.path.abspath(src)}\nlayers {old['layers']}\nexperts {old['experts']}\n"
@@ -424,7 +442,9 @@ def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=F
                     f"engram_layers {old['engram_layers']}\nfinished 1\n")
         return
     expert_bytes = write_experts(srcs, out, n_layers, n_experts)
-    n_engram = write_engram(src, out)
+    n_engram = write_engram(src, out, profile)
+    if profile and n_engram != 2:
+        raise ValueError("libertaidai-29 requires both original Engram tables")
     cfg = json.load(open(os.path.join(src, "config.json")))
     if engram_from is not None:
         copy_engram_hash(engram_from, out)
@@ -434,6 +454,8 @@ def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=F
     for f in ("config.json", "tokenizer.json", "tokenizer_config.json"):
         shutil.copyfile(os.path.join(src, f), os.path.join(out, f))
     with open(info, "w") as f:
+        if profile:
+            f.write(f"profile {profile}\n")
         f.write(f"source {os.path.abspath(src)}\nlayers {n_layers}\nexperts {n_experts}\n"
                 f"dense_tensors {n_dense}\ndense_bytes {dense_bytes}\nexpert_bytes {expert_bytes}\n"
                 f"engram_layers {n_engram}\nfinished 1\n")
@@ -442,6 +464,7 @@ def build_pack(src, out, n_layers=40, n_experts=384, wo_a_fp8=True, dense_only=F
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
+    ap.add_argument("--profile", choices=["libertaidai-29"], help="explicit experimental compatibility pack; no requantization")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=40)
     ap.add_argument("--experts", type=int, default=384)
@@ -455,7 +478,7 @@ def main():
         add_mtp_experts(a.src, a.out)
         return
     build_pack(a.src, a.out, a.layers, a.experts, wo_a_fp8=not a.wo_a_bf16, dense_only=a.dense_only,
-               engram_from=a.engram_from)
+               engram_from=a.engram_from, profile=a.profile)
 
 
 if __name__ == "__main__":

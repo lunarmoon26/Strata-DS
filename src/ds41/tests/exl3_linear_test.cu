@@ -62,7 +62,11 @@ void run(Verdict& verdict, int k, int n, int bits) {
         reference[j] = float(sum);
     }
     had(reference);
-    for (int j = 0; j < n; ++j) reference[j] = bf_round(reference[j] * __half2float(svh[j]));
+    std::vector<float> raw_reference(n);
+    for (int j = 0; j < n; ++j) {
+        raw_reference[j] = reference[j] * __half2float(svh[j]);
+        reference[j] = bf_round(raw_reference[j]);
+    }
     Dev<uint32_t> p(packed); Dev<__nv_bfloat16> x(input), output(n);
     Dev<half> su(suh), sv(svh); Dev<float> logits(n);
     const kernels::Exl3Proj w{reinterpret_cast<uint16_t*>(p.p), su.p, sv.p, k, n, bits * 16, 2};
@@ -91,6 +95,14 @@ void run(Verdict& verdict, int k, int n, int bits) {
     ck(cudaStreamSynchronize(stream), "dense logits"); const auto lg = logits.down();
     bool same = true; for (int i = 0; i < n; ++i) same &= lg[i] == __bfloat162float(got[i]);
     verdict.check(same, "EXL3 head returns BF16-rounded FP32");
+    exl3_linear(x.p, w, nullptr, logits.p, ws.p, bytes, stream, true);
+    ck(cudaStreamSynchronize(stream), "dense raw float");
+    const auto raw = logits.down(); double raw_error = 0, raw_norm = 0;
+    for (int j = 0; j < n; ++j) {
+        raw_error += double(raw[j] - raw_reference[j]) * (raw[j] - raw_reference[j]);
+        raw_norm += double(raw_reference[j]) * raw_reference[j];
+    }
+    verdict.check(raw_norm > 0 && std::sqrt(raw_error / raw_norm) < .006, "raw FP32 EXL3 compressor versus CPU reference");
     for(int rows:{1,4,8}) {
         const int xs=k+128,ys=n+128;
         std::vector<__nv_bfloat16> inputs(size_t(rows)*xs);
@@ -113,11 +125,57 @@ void run(Verdict& verdict, int k, int n, int bits) {
             same &= !std::memcmp(&ry[size_t(r)*ys+j],&want[size_t(r)*ys+j],2) && rl[size_t(r)*ys+j]==want_logits[size_t(r)*ys+j];
         verdict.check(same,"small strided rows/head bit-identical to sequential GEMV");
     }
+    if (n <= 4096) for (int count : {1,3,16}) for (int rows : {1,4,8}) {
+        const int xs=count*k+128, ys=count*n+128;
+        std::vector<__nv_bfloat16> inputs(size_t(rows)*xs);
+        for (size_t i=0;i<inputs.size();++i)
+            inputs[i]=__float2bfloat16_rn(float(int(i%29)-14)/64);
+        std::vector<half> other_scale=svh;
+        for (auto& value:other_scale) value=__float2half(-__half2float(value));
+        Dev<half> alt(other_scale);
+        std::vector<kernels::Exl3Proj> projections(count,w);
+        for (int g=1;g<count;g+=2) projections[g].svh=alt.p;
+        Dev<__nv_bfloat16> bx(inputs), by(size_t(rows)*ys), expected(size_t(rows)*ys);
+        Dev<uint8_t> bws(exl3_projection_batch_workspace_bytes(count,rows,k,n));
+        Dev<uint8_t> rws(exl3_small_rows_workspace_bytes(rows,k,n));
+        // Dev(vector) uploads on the default stream; pageable H2D may return
+        // after staging, before DMA finishes. Our compute stream is nonblocking.
+        ck(cudaStreamSynchronize(nullptr),"projection fixture uploads complete");
+        ck(cudaMemsetAsync(by.p,0x5a,by.n*sizeof(__nv_bfloat16),stream),"batch sentinel");
+        ck(cudaMemsetAsync(expected.p,0x5a,expected.n*sizeof(__nv_bfloat16),stream),"batch reference sentinel");
+        for(int g=0;g<count;++g)
+            exl3_linear_small_rows(bx.p+g*k,projections[g],expected.p+g*n,nullptr,
+                                  rows,xs,ys,rws.p,rws.n,stream);
+        ck(cudaStreamSynchronize(stream),"projection reference complete before capture");
+        cudaGraph_t batch_graph; cudaGraphExec_t batch_exec;
+        ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeRelaxed),"projection batch capture");
+        exl3_projection_batch(bx.p,projections.data(),by.p,count,rows,xs,ys,bws.p,bws.n,stream);
+        ck(cudaStreamEndCapture(stream,&batch_graph),"projection batch capture end");
+        ck(cudaGraphInstantiate(&batch_exec,batch_graph,0),"projection batch instantiate");
+        ck(cudaGraphLaunch(batch_exec,stream),"projection batch replay");
+        ck(cudaStreamSynchronize(stream),"projection batch compare");
+        const auto actual=by.down(), reference=expected.down();
+        if (std::memcmp(actual.data(),reference.data(),actual.size()*sizeof(__nv_bfloat16))) {
+            size_t differences=0;
+            for(size_t i=0;i<actual.size();++i) if(std::memcmp(&actual[i],&reference[i],2)) {
+                if(differences++<4) std::printf("BATCH mismatch k=%d n=%d bits=%d count=%d rows=%d offset=%zu got=%g ref=%g\n",
+                    k,n,bits,count,rows,i,double(__bfloat162float(actual[i])),double(__bfloat162float(reference[i])));
+            }
+            std::printf("BATCH differences=%zu\n",differences);
+        }
+        verdict.check(!std::memcmp(actual.data(),reference.data(),actual.size()*sizeof(__nv_bfloat16)),
+                      "batched projections match separate calls including stride padding");
+        bool rejected=false;
+        try { exl3_projection_batch(bx.p,projections.data(),by.p,count,rows,xs,ys,bws.p,bws.n-1,stream); }
+        catch(const std::invalid_argument&) { rejected=true; }
+        verdict.check(rejected,"projection batch short workspace rejected");
+        cudaGraphExecDestroy(batch_exec); cudaGraphDestroy(batch_graph);
+    }
     bool bad = false;
     try { exl3_linear(x.p, w, output.p, nullptr, ws.p, bytes - 1, stream); }
     catch (const std::invalid_argument&) { bad = true; }
     verdict.check(bad, "short workspace rejected before launch");
-    if (n <= 32768) {
+    if (n <= 32768 && !std::getenv("DS41_TEST_NATIVE_ONLY")) {
         constexpr int rows = 3;
         std::vector<__nv_bfloat16> inputs(size_t(rows) * (k + 128));
         for (int row = 0; row < rows; ++row)
@@ -134,6 +192,15 @@ void run(Verdict& verdict, int k, int n, int bits) {
         }
         const double relative_rows = std::sqrt(re / std::max(rn, 1e-30));
         verdict.check(relative_rows < .006, "batched strided dense GEMM versus CPU reference");
+        Dev<float> raw_rows(size_t(rows) * (n + 128));
+        exl3_linear_rows(dx.p, w, nullptr, rows, k + 128, n + 128, rws.p, row_bytes, stream, raw_rows.p);
+        ck(cudaStreamSynchronize(stream), "batched raw compressor");
+        const auto rf = raw_rows.down(); double raw_error = 0, raw_norm = 0;
+        for (int row = 0; row < rows; ++row) for (int j = 0; j < n; ++j) {
+            const double d = rf[size_t(row) * (n + 128) + j] - raw_reference[j];
+            raw_error += d*d; raw_norm += double(raw_reference[j])*raw_reference[j];
+        }
+        verdict.check(raw_norm > 0 && std::sqrt(raw_error / raw_norm) < .006, "batched raw FP32 compressor versus CPU reference");
         std::printf("EXL3 rows k=%d n=%d bits=%d rel_l2=%.9g\n", k, n, bits, relative_rows);
     }
     std::printf("EXL3 dense k=%d n=%d bits=%d rel_l2=%.9g graph=bitwise\n", k, n, bits, relative);
@@ -183,7 +250,8 @@ void activation(Verdict& verdict) {
 }  // namespace
 int main() {
     require_gpu(); Verdict v;
-    for (int bits : {2, 3, 4, 5}) run(v, 128, 128, bits);
+    for (int bits : {1, 2, 3, 4, 5, 6, 7, 8}) run(v, 128, 128, bits);
+    run(v, 512, 128, 8);  // LibertAIDAI indexer wk
     run(v, 5120, 128, 4); run(v, 128, 129280, 4);
     run(v, 1280, 32768, 4); run(v, 4096, 1024, 5);
     activation(v);

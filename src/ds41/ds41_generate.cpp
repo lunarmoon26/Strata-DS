@@ -416,14 +416,14 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--spec oracle needs --continue-ids with at least --gen + 8 tokens");
         if (!cont_path.empty() && ((int) cont.size() < gen || spec == "suffix" || spec == "dspark" || !force_path.empty() || !dump_path.empty()))
             throw std::invalid_argument("--continue-ids needs at least --gen tokens, without --spec suffix or dspark, --force-ids, --dump");
-        if (spec_max > kVerifyMaxTokens) {
-            std::fprintf(stderr, "spec: cap T at %d until CPU rows 5..8 are validated\n", kVerifyMaxTokens);
-            spec_max = kVerifyMaxTokens;
-        }
         if (!logprobs_path.empty() && list_path.empty()) throw std::invalid_argument("--logprobs-out needs --force-list");
         if (!list_path.empty() && (!force_path.empty() || !dump_path.empty() || !cont_path.empty() || spec != "none" || batched))
             throw std::invalid_argument("--force-list runs step() alone: without --force-ids, --dump, --continue-ids, --spec, --prefill");
         Engine engine(pack, opt);
+        if (spec_max > engine.verify_capacity()) {
+            std::fprintf(stderr, "spec: cap T at configured verifier capacity %d\n", engine.verify_capacity());
+            spec_max = engine.verify_capacity();
+        }
         if (!list_path.empty()) {
             force_list(engine, list_path, logprobs_path);
             return 0;

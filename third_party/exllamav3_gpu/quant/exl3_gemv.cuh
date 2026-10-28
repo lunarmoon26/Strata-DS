@@ -21,9 +21,12 @@ struct GemvJob {
 // K10: integer K1..K6 mul1 or K2 MCG; one row per job. max_n sizes grid.x;
 // each job's n must be a multiple of 128 and no larger than max_n.
 void gemv_mul1(const GemvJob* jobs, int count, int max_n, cudaStream_t stream);
+// Device scratch: count * 9 ints. Groups up to eight jobs with identical weight
+// descriptors; input/output rows retain their original addresses and order.
+void gemv_mul1_grouped(const GemvJob* jobs, int count, int max_n, int* groups, cudaStream_t stream);
 // One shared weight matrix and 1..8 contiguous activation/output rows. The MMA
 // lanes compute all rows using each decoded trellis tile once, preserving the
 // one-row fold/reduction order. No FP16 weight reconstruction is needed.
-void gemv_mul1_rows(const GemvJob* job, int rows, int n, int bits, cudaStream_t stream);
+void gemv_mul1_rows(const GemvJob* job, int rows, int n, int bits, cudaStream_t stream, int count = 1);
 
 }  // namespace strata_exl3

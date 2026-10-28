@@ -20,6 +20,7 @@ struct Engine::Impl::Dspark {
     Layer S[dsk::kStages];
     Fp8 main_proj{};
     const bf16 *main_norm = nullptr, *norm = nullptr, *m_embed = nullptr, *m_head = nullptr, *conf_w = nullptr;
+    const __half *m_head_f16 = nullptr, *conf_w_f16 = nullptr;
     // main_hiddens: the step's row and the verify window's rows (captured inside their graphs), and the pending rows
     // whose main_kv the next draft writes into the rings first (mh rows 0..pend_n-1, positions pend_pos0 on)
     bf16 *step_mh = nullptr, *verify_mh = nullptr, *mh = nullptr;
@@ -118,7 +119,9 @@ void Engine::Impl::dspark_init() {
         y.hc_ffn_fn = f32(p + "hc_ffn_fn");
         y.hc_ffn_base = f32(p + "hc_ffn_base");
         y.hc_ffn_scale = f32(p + "hc_ffn_scale");
-        y.gate_w = bf(p + "ffn.gate.weight");
+        if(pack.dense(p+"ffn.gate.weight").dtype==DType::F16)
+            y.gate_f16=static_cast<const half*>(pack.dense(p+"ffn.gate.weight").device);
+        else y.gate_w = bf(p + "ffn.gate.weight");
         y.gate_bias = f32(p + "ffn.gate.bias");
         y.sh_w1 = fp8(p + "ffn.shared_experts.w1");
         y.sh_w2 = fp8(p + "ffn.shared_experts.w2");
@@ -150,9 +153,13 @@ void Engine::Impl::dspark_init() {
     d.main_norm = bf("mtp.0.main_norm.weight");
     d.norm = bf("mtp.2.norm.weight");
     d.m_embed = bf("mtp.2.markov_head.embed.weight");
-    d.m_head = bf("mtp.2.markov_head.head.weight");
-    d.conf_w = bf("mtp.2.confidence_head.proj.weight");
-    const int B = Dspark::B, M = kVerifyMaxTokens;
+    if(pack.dense("mtp.2.markov_head.head.weight").dtype==DType::F16)
+        d.m_head_f16=static_cast<const half*>(pack.dense("mtp.2.markov_head.head.weight").device);
+    else d.m_head = bf("mtp.2.markov_head.head.weight");
+    if(pack.dense("mtp.2.confidence_head.proj.weight").dtype==DType::F16)
+        d.conf_w_f16=static_cast<const half*>(pack.dense("mtp.2.confidence_head.proj.weight").device);
+    else d.conf_w = bf("mtp.2.confidence_head.proj.weight");
+    const int B = Dspark::B, M = verify_rows_;
     d.step_mh = d.alloc<bf16>(Dspark::kHid);
     d.verify_mh = d.alloc<bf16>((size_t) M * Dspark::kHid);
     d.mh = d.alloc<bf16>((size_t) Dspark::kMaxPend * Dspark::kHid);
@@ -398,7 +405,10 @@ void Engine::Impl::enqueue_draft(int n_pend) {
                               d.fcomb, st);
         ops::rmsnorm(d.xf, y.ffn_norm, d.xf, kDim, kNormEps, B, st);
         int32_t* ids = d.ids + s * B * dsk::kTopK;
-        dsk::router_small(d.xf, B, y.gate_w, y.gate_bias, dsk::kExperts, dsk::kTopK, ids, d.weights, st);
+        if(y.gate_f16) {
+            fp16_weight_linear(d.xf,y.gate_f16,B,kDim,dsk::kExperts,nullptr,d.act,st);
+            dsk::router_small_scores(d.act,B,y.gate_bias,dsk::kExperts,dsk::kTopK,ids,d.weights,st);
+        } else dsk::router_small(d.xf, B, y.gate_w, y.gate_bias, dsk::kExperts, dsk::kTopK, ids, d.weights, st);
         if (pack.has_exl3_dense()) exl3_input_half(d.xf, d.half, B * kDim, st);
         else ops::to_half_fp8q(d.xf, d.half, B * kDim, st);
         // VRAM-set experts: K10 on the GPU (descriptor mode); the rest: the CPU
@@ -491,7 +501,8 @@ void Engine::Impl::enqueue_draft(int n_pend) {
                     tensor->gather(tensor_rank,901+2*s,d.routed+r*kDim,1,kDim,4,st);
                 } else kernels::exl3_moe_decode(reinterpret_cast<const __half*>(d.half) + r * kDim, 1, d.sel,
                                          d.weights + r * dsk::kTopK + j, 1, d.published_desc,
-                                         d.routed + r * kDim, d.vws, VramExperts::kWorkspaceBytes, st);
+                                         d.routed + r * kDim, d.vws, VramExperts::kWorkspaceBytes, st,
+                                         mtp_rate_hints_[size_t(s)]);
                 ck(cudaStreamSynchronize(st), "draft expert complete");
             }
             if(batch) {
@@ -506,12 +517,13 @@ void Engine::Impl::enqueue_draft(int n_pend) {
                     kernels::exl3_moe_tensor_down(B,d.sel,dsk::kTopK,d.published_desc,d.routed,d.vws,VramExperts::kWorkspaceBytes,tensor_rank,st);
                     tensor->gather(tensor_rank,901+2*s,d.routed,B,kDim,4,st);
                 } else kernels::exl3_moe_decode(reinterpret_cast<const __half*>(d.half),B,d.sel,d.weights,dsk::kTopK,
-                                                d.published_desc,d.routed,d.vws,VramExperts::kWorkspaceBytes,st);
+                                                d.published_desc,d.routed,d.vws,VramExperts::kWorkspaceBytes,st,
+                                                mtp_rate_hints_[size_t(s)]);
                 ck(cudaStreamSynchronize(st),"draft batched experts complete");
             }
         } else if (d.vslots)
             kernels::exl3_moe_decode((const __half*) d.half, B, d.sel, d.weights, dsk::kTopK, d.db->gpu_experts(),
-                                     d.routed, d.vws, VramExperts::kWorkspaceBytes, st);
+                                     d.routed, d.vws, VramExperts::kWorkspaceBytes, st, mtp_rate_hints_[size_t(s)]);
         if (!pack.has_exl3_dense()) d.db->wait_add(d.routed, B, (uint32_t) (s + 1), st);
         ops::add_f32_bf16(d.routed, d.sh_out, d.ffn_out, B * kDim, st);
         ops::hc_post(d.ffn_out, d.h2, d.fpost, d.fcomb, d.h, B, st);
@@ -524,11 +536,14 @@ void Engine::Impl::enqueue_draft(int n_pend) {
         projection(d.xn,head_exl3,nullptr,d.logits,B,kDim,kVocab,d.dense,d.dense_bytes,st);
     } else ops::bf16_linear_rows(d.xn, B, head, kDim, kVocab, d.logits, st);
     for (int i = 0; i < B; ++i) {   // draft i: the Markov bias of the token before it, then the greedy pick
-        dsk::markov_bias(i == 0 ? d.prm : d.out + i - 1, d.m_embed, d.m_head, kVocab, d.logits + (size_t) i * kVocab,
-                         d.memb + i * dsk::kMarkovRank, st);
+        if(d.m_head_f16) dsk::markov_bias(i==0?d.prm:d.out+i-1,d.m_embed,d.m_head_f16,kVocab,
+                                           d.logits+size_t(i)*kVocab,d.memb+i*dsk::kMarkovRank,st);
+        else dsk::markov_bias(i == 0 ? d.prm : d.out + i - 1, d.m_embed, d.m_head, kVocab, d.logits + (size_t) i * kVocab,
+                          d.memb + i * dsk::kMarkovRank, st);
         ops::argmax_logits(d.logits + (size_t) i * kVocab, d.out + i, st);
     }
-    dsk::confidence_rows(d.xfin, d.memb, d.conf_w, B, d.conf, st);
+    if(d.conf_w_f16) dsk::confidence_rows(d.xfin,d.memb,d.conf_w_f16,B,d.conf,st);
+    else dsk::confidence_rows(d.xfin, d.memb, d.conf_w, B, d.conf, st);
     ck(cudaMemcpyAsync(d.out_host, d.out, B * sizeof(int32_t), cudaMemcpyDeviceToHost, st), "dspark drafts");
     ck(cudaMemcpyAsync(d.conf_host, d.conf, B * sizeof(float), cudaMemcpyDeviceToHost, st), "dspark confidence");
     ck(cudaMemcpyAsync(d.ids_host, d.ids, dsk::kStages * B * dsk::kTopK * sizeof(int32_t), cudaMemcpyDeviceToHost, st),
@@ -583,7 +598,7 @@ Engine::Draft Engine::Impl::draft(int token) {
     p[10] = pos - 1;
     for (int i = 0; i < d.pend_n; ++i) p[Dspark::kPrm + i] = d.pend_pos0 + i;
     int n_pend = d.pend_n;
-    if (n_pend > kVerifyMaxTokens) {   // a prefill's rows: written eagerly, the graphs cover a window's rows
+    if (n_pend > verify_rows_) {   // a prefill's rows: eager, graphs cover the configured verifier's rows
         ck(cudaMemcpyAsync(d.prm, d.prm_host, (Dspark::kPrm + n_pend) * sizeof(int), cudaMemcpyHostToDevice, st),
            "dspark params");
         dspark_ring(n_pend, st);
@@ -668,6 +683,12 @@ Engine::Draft Engine::Impl::draft(int token) {
         r.accept[i] = 1.0f / (1.0f + std::exp(-d.conf_host[i]));
     }
     r.cpu_experts_ms = worker_us.load() / 1000.0;
+    if(draft_cumulative_>0) {
+        float cumulative=1;int keep=0;
+        while(keep<r.n && std::isfinite(r.accept[keep]) &&
+              (cumulative*=r.accept[keep])>=draft_cumulative_) ++keep;
+        r.n=keep;
+    }
     r.vram_hits = d.last_hits;
     if(pack.has_exl3_dense()) r.vram_hits=d.cache_hits;
     r.uses = d.last_uses;
@@ -720,16 +741,37 @@ Engine::Draft Engine::draft(int token) {
             }
             // Gather five embedding rows on their owning GPU. No duplicate
             // embedding arena and no peer dereference inside the draft kernels.
-            for (int r = 0; r < dspark::kBlock; ++r) {
+            const auto handoff_before = impl_->handoff->stats();
+            const double embedding_start = now_ms();
+            if (impl_->draft_bulk_embedding_) {
+                static_assert(dspark::kBlock == 5 && sizeof(Impl::StepParams) == 5 * sizeof(int));
+                if (!impl_->draft_embedding_rows_) throw std::logic_error("missing bulk draft embedding scratch");
                 DeviceScope first(impl_->stage.device);
-                impl_->hp->token = r == 0 ? token : dspark::kNoiseToken;
-                ck(cudaMemcpyAsync(impl_->dp, impl_->hp, sizeof(int), cudaMemcpyHostToDevice, impl_->st), "draft embedding token");
-                ops::embed_device(impl_->embed, impl_->dp, impl_->h, impl_->st);
-                impl_->handoff->copy(tail_->ds->h + size_t(r) * kHc * kDim, impl_->h,
-                                     kHc * kDim * sizeof(bf16), impl_->st, tail_->st);
+                *impl_->hp = Impl::StepParams{token, dspark::kNoiseToken, dspark::kNoiseToken,
+                                             dspark::kNoiseToken, dspark::kNoiseToken};
+                ck(cudaMemcpyAsync(impl_->dp, impl_->hp, sizeof(Impl::StepParams), cudaMemcpyHostToDevice, impl_->st),
+                   "draft embedding tokens");
+                ops::embed_device_rows(impl_->embed, impl_->dp, impl_->draft_embedding_rows_, dspark::kBlock, impl_->st);
+                impl_->handoff->copy_group({{tail_->ds->h, impl_->draft_embedding_rows_,
+                                             size_t(dspark::kBlock) * kHc * kDim * sizeof(bf16)}},
+                                            impl_->st, tail_->st);
+            } else for (int r = 0; r < dspark::kBlock; ++r) {
+                    DeviceScope first(impl_->stage.device);
+                    impl_->hp->token = r == 0 ? token : dspark::kNoiseToken;
+                    ck(cudaMemcpyAsync(impl_->dp, impl_->hp, sizeof(int), cudaMemcpyHostToDevice, impl_->st), "draft embedding token");
+                    ops::embed_device(impl_->embed, impl_->dp, impl_->h, impl_->st);
+                    impl_->handoff->copy(tail_->ds->h + size_t(r) * kHc * kDim, impl_->h,
+                                         kHc * kDim * sizeof(bf16), impl_->st, tail_->st);
             }
+            const double embedding_ms = now_ms() - embedding_start;
+            const auto handoff_after = impl_->handoff->stats();
             DeviceScope last(tail_->stage.device);
-            return tail_->draft(token);
+            auto result = tail_->draft(token);
+            result.embedding_handoff_ms = embedding_ms;
+            result.embedding_handoff_groups = handoff_after.groups - handoff_before.groups;
+            result.embedding_handoff_copies = handoff_after.copy_calls - handoff_before.copy_calls;
+            result.embedding_handoff_host_waits = handoff_after.host_waits - handoff_before.host_waits;
+            return result;
         } catch (...) { impl_->broken = tail_->broken = true; throw; }
     }
     DeviceScope scope(impl_->stage.device);

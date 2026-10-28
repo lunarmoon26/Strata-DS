@@ -4,6 +4,8 @@
 namespace strata::ds41 {
 // CPU multi-row kernels above four rows are being fixed in a separate worktree.
 inline constexpr int kVerifyMaxTokens = 4;
+// Separate from CPU batch slots: only the opt-in resident 2.9 verifier uses six.
+inline constexpr int kVerifyMaxResidentTokens = 6;
 struct VerifyResult {
     bool graph_reused = false;             // True when this call replayed an existing window graph.
     std::vector<int> next;                 // next[t] follows inputs [0, t].

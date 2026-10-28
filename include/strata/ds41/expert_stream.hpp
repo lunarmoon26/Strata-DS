@@ -25,6 +25,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,7 +42,8 @@ public:
     /// host_buffers: pinned staging buffers of slot_bytes each (how far the reads can run ahead of the copies).
     /// unbuffered: read the pack with O_DIRECT (4 KiB-aligned windows); false, or O_DIRECT refused: plain reads.
     ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes, int readers,
-                 int host_buffers, bool unbuffered = false);
+                 int host_buffers, bool unbuffered = false,
+                 std::function<const uint8_t*(int,int)> frozen_ram_source = {});
     bool unbuffered() const { return direct_; }
     ~ExpertStream();
     ExpertStream(const ExpertStream&) = delete;
@@ -74,6 +76,7 @@ private:
 
     const Pack& pack_;
     const HostExperts* host_;
+    std::function<const uint8_t*(int,int)> frozen_ram_source_;
     bool direct_ = false;
     uint8_t* ring_;
     int slots_, n_host_;

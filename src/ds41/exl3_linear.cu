@@ -30,7 +30,7 @@ __global__ void prepare(const __nv_bfloat16* x, kernels::Exl3Proj w,
         *job = Job{a, w.trellis, c, w.k, w.n, w.tile_w / 16, w.codebook};
 }
 
-__global__ void finish(const float* c, const half* svh, __nv_bfloat16* y, float* logits) {
+__global__ void finish(const float* c, const half* svh, __nv_bfloat16* y, float* logits, bool raw_float) {
     const int off = blockIdx.y * 128;
     __shared__ __align__(16) float output[128];
     had_ff_r_128_inner<false, true>(c + off, output, svh, scale);
@@ -38,7 +38,7 @@ __global__ void finish(const float* c, const half* svh, __nv_bfloat16* y, float*
     for (int i = threadIdx.x; i < 128; i += 32) {
         const auto v = __float2bfloat16_rn(output[i]);
         if (y) y[off + i] = v;
-        else logits[off + i] = __bfloat162float(v);
+        else logits[off + i] = raw_float ? output[i] : __bfloat162float(v);
     }
 }
 
@@ -62,6 +62,14 @@ __global__ void finish_rows(const float* c, const half* svh, __nv_bfloat16* y, i
         y[size_t(row) * stride + off + i] = __float2bfloat16_rn(output[i]);
 }
 
+__global__ void finish_float_rows(const float* c, const half* svh, float* y, int n, int stride) {
+    const int off = blockIdx.y * 128, row = blockIdx.x;
+    __shared__ __align__(16) float output[128];
+    had_ff_r_128_inner<false, true>(c + size_t(row) * n + off, output, svh, scale);
+    __syncwarp();
+    for (int i = threadIdx.x; i < 128; i += 32) y[size_t(row) * stride + off + i] = output[i];
+}
+
 __global__ void prepare_small_rows(const __nv_bfloat16* x, kernels::Exl3Proj w,
                                    half* a, float* c, Job* jobs, int stride) {
     const int off = blockIdx.y * 128, row = blockIdx.x;
@@ -83,7 +91,66 @@ __global__ void finish_small_logits(const float* c, const half* svh, float* out,
     for (int i = threadIdx.x; i < 128; i += 32)
         out[size_t(row) * stride + off + i] = __bfloat162float(__float2bfloat16_rn(output[i]));
 }
+struct ProjectionBatch { kernels::Exl3Proj weights[16]; };
+
+__global__ void prepare_projection_batch(const __nv_bfloat16* x, ProjectionBatch batch,
+                                         half* a, float* c, Job* jobs, int rows, int xs) {
+    const int group = blockIdx.z, row = blockIdx.x, off = blockIdx.y * 128;
+    const auto w = batch.weights[group];
+    __shared__ __align__(16) half input[128];
+    for (int i = threadIdx.x; i < 128; i += 32)
+        input[i] = __float2half_rn(__bfloat162float(x[size_t(row)*xs+group*w.k+off+i]));
+    __syncwarp();
+    had_hf_r_128_inner<true,false>(input,a+(size_t(group)*rows+row)*w.k+off,w.suh,scale);
+    if (!row && !off && !threadIdx.x)
+        jobs[group] = Job{a+size_t(group)*rows*w.k,w.trellis,c+size_t(group)*rows*w.n,
+                          w.k,w.n,w.tile_w/16,w.codebook};
+}
+
+__global__ void finish_projection_batch(const float* c, ProjectionBatch batch,
+                                        __nv_bfloat16* y, int rows, int ys) {
+    const int group = blockIdx.z, row = blockIdx.x, off = blockIdx.y * 128;
+    const auto w = batch.weights[group];
+    __shared__ __align__(16) float output[128];
+    had_ff_r_128_inner<false,true>(c+(size_t(group)*rows+row)*w.n+off,output,w.svh,scale);
+    __syncwarp();
+    for (int i = threadIdx.x; i < 128; i += 32)
+        y[size_t(row)*ys+group*w.n+off+i] = __float2bfloat16_rn(output[i]);
+}
 }  // namespace
+
+size_t exl3_projection_batch_workspace_bytes(int count, int rows, int k, int n) {
+    exl3_small_rows_workspace_bytes(rows,k,n);
+    if (count < 1 || count > 16) throw std::invalid_argument("EXL3 projection batch: count must be 1..16");
+    return ((sizeof(Job)*count+15)&~size_t(15)) + size_t(count)*rows*(k*sizeof(half)+n*sizeof(float));
+}
+
+void exl3_projection_batch(const __nv_bfloat16* x, const kernels::Exl3Proj* weights,
+                           __nv_bfloat16* y, int count, int rows, int xs, int ys,
+                           void* workspace, size_t bytes, cudaStream_t stream) {
+    if (!x || !y || !weights || !workspace || reinterpret_cast<uintptr_t>(workspace)%16)
+        throw std::invalid_argument("EXL3 projection batch: null or unaligned argument");
+    const auto& first = weights[0];
+    const size_t required = exl3_projection_batch_workspace_bytes(count,rows,first.k,first.n);
+    if (bytes < required || xs < count*first.k || ys < count*first.n)
+        throw std::invalid_argument("EXL3 projection batch: workspace or stride too small");
+    ProjectionBatch batch{};
+    for (int i = 0; i < count; ++i) {
+        const auto& w = weights[i];
+        if (!w.trellis || !w.suh || !w.svh || w.k != first.k || w.n != first.n ||
+            w.tile_w != first.tile_w || w.codebook != 2 || w.shard_count == 2 ||
+            w.tile_w < 16 || w.tile_w > 128 || w.tile_w%16)
+            throw std::invalid_argument("EXL3 projection batch: incompatible projection");
+        batch.weights[i] = w;
+    }
+    auto* jobs = static_cast<Job*>(workspace);
+    auto* a = reinterpret_cast<half*>(static_cast<char*>(workspace)+((sizeof(Job)*count+15)&~size_t(15)));
+    auto* c = reinterpret_cast<float*>(a+size_t(count)*rows*first.k);
+    prepare_projection_batch<<<dim3(rows,first.k/128,count),32,0,stream>>>(x,batch,a,c,jobs,rows,xs);
+    strata_exl3::gemv_mul1_rows(jobs,rows,first.n,first.tile_w/16,stream,count);
+    finish_projection_batch<<<dim3(rows,first.n/128,count),32,0,stream>>>(c,batch,y,rows,ys);
+    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("EXL3 projection batch launch failed");
+}
 
 size_t exl3_small_rows_workspace_bytes(int rows, int k, int n) {
     exl3_linear_workspace_bytes(k, n);
@@ -96,7 +163,7 @@ void exl3_linear_small_rows(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
                             void* workspace, size_t bytes, cudaStream_t stream) {
     if (!x || (!y == !logits) || !workspace || reinterpret_cast<uintptr_t>(workspace) % 16 ||
         xs < w.k || ys < w.n || !w.trellis || !w.suh || !w.svh || w.codebook != 2 ||
-        w.tile_w < 16 || w.tile_w > 96 || w.tile_w % 16 ||
+        w.tile_w < 16 || w.tile_w > 128 || w.tile_w % 16 ||
         bytes < exl3_small_rows_workspace_bytes(rows, w.k, w.n))
         throw std::invalid_argument("EXL3 small rows: invalid arguments/workspace");
     auto* jobs = static_cast<Job*>(workspace);
@@ -118,18 +185,19 @@ size_t exl3_linear_workspace_bytes(int k, int n) {
 
 void exl3_linear(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
                  __nv_bfloat16* y, float* logits, void* workspace,
-                 size_t bytes, cudaStream_t stream) {
+                  size_t bytes, cudaStream_t stream, bool raw_float) {
     if (!x || (!y == !logits) || !workspace || reinterpret_cast<uintptr_t>(workspace) % 16 ||
         !w.trellis || !w.suh || !w.svh || w.codebook != 2 ||
-        w.tile_w % 16 || w.tile_w < 16 || w.tile_w > 96 ||
+        w.tile_w % 16 || w.tile_w < 16 || w.tile_w > 128 ||
         bytes < exl3_linear_workspace_bytes(w.k, w.n))
         throw std::invalid_argument("EXL3 dense: invalid projection, output or workspace");
     auto* job = static_cast<Job*>(workspace);
     auto* a = reinterpret_cast<half*>(static_cast<char*>(workspace) + job_bytes);
     auto* c = reinterpret_cast<float*>(a + w.k);
     prepare<<<dim3(1, w.k / 128), 32, 0, stream>>>(x, w, a, c, job);
-    strata_exl3::gemv_mul1(job, 1, w.n, stream);
-    finish<<<dim3(1, w.n / 128), 32, 0, stream>>>(c, w.svh, y, logits);
+    if (w.tile_w > 96) strata_exl3::gemv_mul1_rows(job, 1, w.n, w.tile_w / 16, stream);
+    else strata_exl3::gemv_mul1(job, 1, w.n, stream);
+    finish<<<dim3(1, w.n / 128), 32, 0, stream>>>(c, w.svh, y, logits, raw_float);
     if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("EXL3 dense launch failed");
 }
 
@@ -145,9 +213,9 @@ size_t exl3_rows_workspace_bytes(int rows, int k, int n) {
 
 void exl3_linear_rows(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
                       __nv_bfloat16* y, int rows, int xs, int ys,
-                      void* workspace, size_t bytes, cudaStream_t stream) {
-    if (!x || !y || !workspace || reinterpret_cast<uintptr_t>(workspace) % 256 || xs < w.k || ys < w.n ||
-        w.codebook != 2 || w.tile_w < 16 || w.tile_w > 96 || w.tile_w % 16 ||
+                       void* workspace, size_t bytes, cudaStream_t stream, float* raw_float) {
+    if (!x || (!y == !raw_float) || !workspace || reinterpret_cast<uintptr_t>(workspace) % 256 || xs < w.k || ys < w.n ||
+        w.codebook != 2 || w.tile_w < 16 || w.tile_w > 128 || w.tile_w % 16 ||
         !w.trellis || !w.suh || !w.svh || bytes < exl3_rows_workspace_bytes(rows, w.k, w.n))
         throw std::invalid_argument("EXL3 rows: invalid arguments/workspace");
     auto* job = static_cast<strata_exl3::ReconstructJob*>(workspace);
@@ -164,7 +232,8 @@ void exl3_linear_rows(const __nv_bfloat16* x, const kernels::Exl3Proj& w,
     kernels::k12::check_blas(cublasSetStream(handle, stream), "rows stream");
     kernels::k12::check_blas(cublasSetWorkspace(handle, blas, blas_bytes), "rows workspace");
     kernels::k12::gemm(handle, a, matrix, c, rows, w.k, w.n);
-    finish_rows<<<dim3(rows, w.n / 128), 32, 0, stream>>>(c, w.svh, y, w.n, ys);
+    if (y) finish_rows<<<dim3(rows, w.n / 128), 32, 0, stream>>>(c, w.svh, y, w.n, ys);
+    else finish_float_rows<<<dim3(rows, w.n / 128), 32, 0, stream>>>(c, w.svh, raw_float, w.n, ys);
     if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("EXL3 rows launch failed");
 }
 }  // namespace strata::ds41

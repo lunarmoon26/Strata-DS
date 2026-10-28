@@ -32,9 +32,10 @@ struct Fixture {
     std::vector<kk::Exl3Expert> hd, vd;
     std::vector<sd::ExpertBlob> blobs;
     bool mcg;
+    int uniform_rate = 0;
     static constexpr size_t trellis = size_t(H / 16) * (F / 16) * 96;
-    static constexpr size_t per = 3 * (trellis + H + F);
-    explicit Fixture(bool use_mcg = false) : vram(per * E), hd(E), vd(E), blobs(E), mcg(use_mcg) {
+    static constexpr size_t per = 128 + 3 * (trellis + H + F);
+    explicit Fixture(bool use_mcg = false, int rate = 0) : vram(per * E), hd(E), vd(E), blobs(E), mcg(use_mcg), uniform_rate(rate) {
         ck(cudaHostAlloc(&host, per * E * 2, cudaHostAllocMapped), "mapped experts");
         ck(cudaHostGetDevicePointer(&alias, host, 0), "expert alias");
         std::memset(host, 0x5a, per * E * 2);
@@ -59,9 +60,9 @@ struct Fixture {
                 for (int i = 0; i < n; ++i)
                     host[at++] = __half_as_ushort(__float2half((rng() & 1) ? 0.02f : -0.02f));
             };
-            proj(H, F, mcg ? 2 : e % 6 + 1, hd[e].w1, vd[e].w1);
-            proj(H, F, mcg ? 2 : (e + 1) % 6 + 1, hd[e].w3, vd[e].w3);
-            proj(F, H, mcg ? 2 : (e + 5) % 6 + 1, hd[e].w2, vd[e].w2);
+            proj(H, F, mcg ? 2 : uniform_rate ? uniform_rate : e % 6 + 1, hd[e].w1, vd[e].w1);
+            proj(H, F, mcg ? 2 : uniform_rate ? uniform_rate : (e + 1) % 6 + 1, hd[e].w3, vd[e].w3);
+            proj(F, H, mcg ? 2 : uniform_rate ? uniform_rate : (e + 5) % 6 + 1, hd[e].w2, vd[e].w2);
             blobs[e] = {(at - start) * 2, 256};
         }
         ck(cudaMemcpy(vram.p, host, per * E * 2, cudaMemcpyHostToDevice), "expert upload");
@@ -322,6 +323,113 @@ void absent_tiers(Verdict& v, Fixture& f) {
     ck(cudaDeviceSynchronize(), "null quota publish");
     v.check(db.counts().cpu == K && db.counts().zero_copy == 0, "null quota means zero");
 }
+// Compare multi-row expert execution to independent single-token calls. Covers
+// duplicate groups larger than eight, inactive uses and changing graph routes.
+void grouped_rows(Verdict& v, Fixture& f) {
+    constexpr int m = 8;
+    std::vector<uint16_t> hx(m * H);
+    for (int i = 0; i < m * H; ++i)
+        hx[i] = __half_as_ushort(__float2half(float(i % 37 - 18) / 64));
+    Dev<uint16_t> x(hx);
+    Dev<int32_t> ids(m * K);
+    Dev<float> weights(m * K), got(m * H), ref(m * H);
+    Dev<kk::Exl3Expert> descriptors(f.vd);
+    Dev<uint8_t> workspace(64ull << 20);
+    cudaStream_t stream;
+    ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "grouped stream");
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), "grouped capture");
+    kk::exl3_moe_decode((const half*)x.p,m,ids.p,weights.p,K,descriptors.p,
+                       got.p,workspace.p,workspace.n,stream);
+    ck(cudaStreamEndCapture(stream,&graph), "grouped capture end");
+    ck(cudaGraphInstantiate(&exec,graph,0), "grouped instantiate");
+    for (int pass = 0; pass < 10; ++pass) {
+        std::vector<int32_t> route(m * K);
+        std::vector<float> w(m * K), initial(m * H);
+        for (int i = 0; i < m * K; ++i) {
+            route[i] = pass < 8 ? pass : (i * 3 + i / K) % E;
+            if (pass == 9 && i % 3 == 0) route[i] = -1;
+            w[i] = float(i % 11 + 1) / 32;
+        }
+        for (int i = 0; i < m * H; ++i) initial[i] = float(i % 7 - 3) / 128;
+        ids.up(route); weights.up(w); got.up(initial); ref.up(initial);
+        ck(cudaGraphLaunch(exec,stream), "grouped replay");
+        for (int t = 0; t < m; ++t)
+            kk::exl3_moe_decode((const half*)x.p+t*H,1,ids.p+t*K,weights.p+t*K,K,
+                               descriptors.p,ref.p+t*H,workspace.p,workspace.n,stream);
+        ck(cudaStreamSynchronize(stream), "grouped comparison");
+        const auto a = got.down(), b = ref.down();
+        v.check(std::memcmp(a.data(),b.data(),a.size()*sizeof(float)) == 0,
+                "grouped expert rows equal single-token arithmetic exactly");
+    }
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+}
+// The opt-in per-rate expert dispatch must equal the generic mixed-rate kernel
+// bit for bit on single-rate tables, including inactive routes and CUDA-graph
+// replay (production captures the dispatch inside its verifier graphs).
+void rate_dispatch(Verdict& v, Fixture& f, int m, bool native_qdq) {
+    const int rate = f.uniform_rate;
+    std::vector<uint16_t> hx(m * H);
+    for (int i = 0; i < m * H; ++i)
+        hx[i] = __half_as_ushort(__float2half(float(i % 23 - 11) / 64));
+    Dev<uint16_t> x(hx);
+    Dev<int32_t> ids(m * K);
+    Dev<float> weights(m * K), got(m * H), ref(m * H);
+    auto expert_table = f.vd;
+    for (auto& expert : expert_table) expert.native_qdq = native_qdq;
+    Dev<kk::Exl3Expert> descriptors(expert_table);
+    Dev<uint8_t> workspace(64ull << 20);
+    cudaStream_t stream;
+    ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "rate stream");
+    for (int pass = 0; pass < 6; ++pass) {
+        std::vector<int32_t> route(m * K);
+        std::vector<float> w(m * K), initial(m * H);
+        for (int i = 0; i < m * K; ++i) {
+            route[i] = (i * 5 + pass) % E;
+            if (pass % 3 == 0 && i % 4 == 0) route[i] = -1;
+            w[i] = float(i % 9 + 1) / 16;
+        }
+        for (int i = 0; i < m * H; ++i) initial[i] = float(i % 5 - 2) / 128;
+        ids.up(route); weights.up(w); got.up(initial); ref.up(initial);
+        ck(cudaStreamSynchronize(nullptr), "rate uploads complete");
+        kk::exl3_moe_decode((const half*)x.p, m, ids.p, weights.p, K, descriptors.p, ref.p,
+                            workspace.p, workspace.n, stream, 0);
+        kk::exl3_moe_decode((const half*)x.p, m, ids.p, weights.p, K, descriptors.p, got.p,
+                            workspace.p, workspace.n, stream, rate);
+        ck(cudaStreamSynchronize(stream), "rate comparison");
+        const auto a = got.down(), b = ref.down();
+        v.check(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+                "per-rate expert dispatch equals the generic kernel bit for bit");
+    }
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), "rate capture");
+    kk::exl3_moe_decode((const half*)x.p, m, ids.p, weights.p, K, descriptors.p, got.p,
+                        workspace.p, workspace.n, stream, rate);
+    ck(cudaStreamEndCapture(stream, &graph), "rate capture end");
+    ck(cudaGraphInstantiate(&exec, graph, 0), "rate instantiate");
+    for (int replay = 0; replay < 5; ++replay) {
+        std::vector<int32_t> route(m * K);
+        std::vector<float> w(m * K), initial(m * H);
+        for (int i = 0; i < m * K; ++i) {
+            route[i] = (i * 7 + replay * 3) % E;
+            if (replay % 2 && i % 5 == 0) route[i] = -1;
+            w[i] = float(i % 7 + 1) / 32;
+        }
+        for (int i = 0; i < m * H; ++i) initial[i] = float(i % 9 - 4) / 256;
+        ids.up(route); weights.up(w); got.up(initial); ref.up(initial);
+        ck(cudaStreamSynchronize(nullptr), "rate replay uploads complete");
+        ck(cudaGraphLaunch(exec, stream), "rate replay");
+        kk::exl3_moe_decode((const half*)x.p, m, ids.p, weights.p, K, descriptors.p, ref.p,
+                            workspace.p, workspace.n, stream, 0);
+        ck(cudaStreamSynchronize(stream), "rate replay comparison");
+        const auto a = got.down(), b = ref.down();
+        v.check(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+                "per-rate expert dispatch stays exact under graph replay");
+    }
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+}
 }  // namespace
 
 int main() {
@@ -329,10 +437,26 @@ int main() {
     Verdict v;
     Fixture fixture;
     resident_split(v, fixture);
+    grouped_rows(v, fixture);
     absent_tiers(v, fixture);
     for (bool staged : {false, true})
         for (int m = 1; m <= 8; ++m) run(v, fixture, m, staged);
     Fixture mcg(true);
     resident_split(v, mcg);
+    grouped_rows(v, mcg);
+    // The hint is only honored when the opt-in environment gate is enabled.
+    if (const char* enabled = std::getenv("DS41_EXPERIMENTAL_EXPERT_RATE_KERNEL");
+        enabled && !std::strcmp(enabled, "1")) {
+        for (int rate : {1, 2, 3, 4, 5, 6}) {
+            Fixture uniform(false, rate);
+            rate_dispatch(v, uniform, 4, false);
+            rate_dispatch(v, uniform, 4, true);
+            if (rate <= 4) {
+                rate_dispatch(v, uniform, 1, false);
+                rate_dispatch(v, uniform, 8, true);
+            }
+        }
+        std::printf("RATE_DISPATCH exact=1 rates=1,2,3,4,5,6 rows=1,4,8 qdq=0,1 graph_replay=1\n");
+    }
     return v.finish();
 }

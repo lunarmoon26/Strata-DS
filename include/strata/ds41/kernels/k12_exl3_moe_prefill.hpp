@@ -5,8 +5,35 @@
 #pragma once
 
 #include "strata/ds41/kernels/k10_exl3_moe.hpp"
+#include <memory>
 
 namespace strata::ds41::kernels {
+
+/// One serialized prefill's exact expert graphs. Caller buffers outlive this
+/// owner; all calls use one stream. Bounded to 128 row shapes; defaults elsewhere
+/// remain eager. Destruction synchronizes consumers before releasing bindings.
+class Exl3PrefillGraphs {
+public:
+    Exl3PrefillGraphs(const __half* x,const int32_t* tok,const float* weights,float* out,void* workspace,size_t bytes);
+    ~Exl3PrefillGraphs();
+    Exl3PrefillGraphs(const Exl3PrefillGraphs&)=delete;
+    Exl3PrefillGraphs& operator=(const Exl3PrefillGraphs&)=delete;
+    void run(const int32_t* offsets,int groups,const Exl3Expert* experts,cudaStream_t stream);
+    uint64_t captures() const;
+    uint64_t replays() const;
+    uint64_t eager_calls() const;
+    size_t shapes() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/// Bounded reconstructed expert waves, with the reference GEMM/scatter order.
+/// groups_per_wave is 1..16. Offsets retain the original grouped-row indexing.
+size_t exl3_moe_batched_workspace_bytes(int max_rows, int groups_per_wave);
+void exl3_moe_prefill_batched(const __half* x,const int32_t* tok,const float* weights,
+                            const int32_t* offsets,int groups,const Exl3Expert* experts,float* out,
+                            void* workspace,size_t bytes,int groups_per_wave,cudaStream_t stream);
 
 /// Workspace bytes that exl3_moe_prefill needs for calls with at most max_rows rows and max_groups groups.
 size_t exl3_moe_prefill_workspace_bytes(int max_rows, int max_groups);
@@ -33,9 +60,16 @@ void exl3_moe_prefill(const __half* x, const int32_t* tok, const float* w, const
 /// differ across projections. residency maps expert ids to resident descriptors;
 /// null is identity. ids[tokens,topk] accepts -1 padding; topk <=6, tokens <=1024.
 /// active_groups, if supplied, is a stream-ordered additive device counter.
-size_t exl3_moe_grouped_workspace_bytes(int tokens,int topk,int groups);
+/// active_rows, when nonzero, bounds the number of non-padding assignments;
+/// it compacts wave scratch and launch grids. The device planner checks the bound.
+size_t exl3_moe_grouped_workspace_bytes(int tokens,int topk,int groups,int active_rows=0);
 void exl3_moe_prefill_grouped(const __half* x,const int32_t* ids,const float* weights,int tokens,int topk,
                              const Exl3Expert* experts,const int32_t* residency,int groups,float* out,
-                             void* workspace,size_t bytes,int32_t* active_groups,cudaStream_t stream);
+                              void* workspace,size_t bytes,int32_t* active_groups,cudaStream_t stream,int active_rows=0);
+
+/// Select one ordered expert wave: map[original_id] in [first,first+groups)
+/// becomes a local descriptor index; everything else is -1 padding.
+void exl3_moe_remap_routes(const int32_t* ids,const int32_t* map,int rows,int first,int groups,
+                           int32_t* filtered,cudaStream_t stream);
 
 }  // namespace strata::ds41::kernels

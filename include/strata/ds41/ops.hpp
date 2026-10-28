@@ -77,11 +77,15 @@ void compress_pool(const float* kv_state, const float* score_state, int ratio, b
 /// Rows (prefill): h [rows][4][5120], kv [rows][5][5120]
 void engram_apply(bf16* h, const bf16* kv /* [5*5120]: 4 keys then value */, const bf16* qw, const bf16* kw, float eps,
                   int rows = 1, cudaStream_t stream = 0);
+void engram_apply_f32(bf16* h, const bf16* kv, const float* qw, const float* kw, float eps,
+                      int rows = 1, cudaStream_t stream = 0);
 /// Engram rows: FP8 E4M3 [rows][256] times E8M0 [rows][8] -> BF16 [rows][256]
 void engram_dequant(const uint8_t* w, const uint8_t* s, int rows, bf16* out, cudaStream_t stream = 0);
 
 /// Fixed graph parameters. The caller keeps device scalars alive through all replays.
 void embed_device(const bf16* table, const int* token_dev, bf16* h, cudaStream_t stream = 0);
+/// Identical embedding for 1..8 device token IDs into [rows][kHc][kDim].
+void embed_device_rows(const bf16* table, const int* tokens_dev, bf16* h, int rows, cudaStream_t stream = 0);
 void window_index_device(const int* pos_dev, int32_t* idx, cudaStream_t stream = 0);
 /// cs_table contains rows of kRopeDim floats. Read row *pos_dev + offset.
 /// A negative row does no work (the first incomplete compressor group).

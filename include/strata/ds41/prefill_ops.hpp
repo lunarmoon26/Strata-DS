@@ -22,7 +22,7 @@ void rope_rows(bf16* v, int rows, int n_vec, int stride, const float* table, int
 
 /// Routing from FP32 logits [rows][384] (K8's math after its dot products): s = sqrt(softplus(logit)), the 6
 /// experts with the largest s + bias (ties: lower id) in that order, weight = s / (sum of the 6 s + 1e-20) * 1.5.
-void route_rows(const float* logits, const float* bias, int rows, int32_t* ids, float* weights);
+void route_rows(const float* logits, const float* bias, int rows, int32_t* ids, float* weights, cudaStream_t stream = 0);
 
 /// Attention index lists of a chunk for a single KV buffer (K13): the query at chunk row r (position p0 + r) gets
 /// [128 window entries, oldest first: position p0 + r - 127 + j at kv row win_base + r + j, -1 before position 0]

@@ -35,9 +35,9 @@ struct Buffers {
     float *gu,*down;
     size_t bytes=0;
     int max_jobs;
-    Buffers(void* base,int tokens,int topk,int groups) {
+    Buffers(void* base,int tokens,int topk,int groups,int capacity) {
         const size_t rows=size_t(tokens)*topk;
-        max_jobs=int((rows+M-1)/M)+groups;
+        max_jobs=(capacity+M-1)/M+groups;
         auto take=[&](size_t n,size_t width) {
             bytes=(bytes+255)&~size_t(255);
             void* p=base?static_cast<char*>(base)+bytes:nullptr;bytes+=n*width;return p;
@@ -45,26 +45,36 @@ struct Buffers {
         counts=static_cast<int*>(take(groups,sizeof(int)));
         offsets=static_cast<int*>(take(groups+1,sizeof(int)));
         cursor=static_cast<int*>(take(groups,sizeof(int)));
-        slots=static_cast<int*>(take(rows,sizeof(int)));
+        slots=static_cast<int*>(take(capacity,sizeof(int)));
         reverse=static_cast<int*>(take(rows,sizeof(int)));
-        labels=static_cast<int*>(take(rows,sizeof(int)));
+        labels=static_cast<int*>(take(capacity,sizeof(int)));
         jobs=static_cast<Job*>(take(max_jobs,sizeof(Job)));
-        input=static_cast<half*>(take(2*rows*H,sizeof(half)));
+        input=static_cast<half*>(take(size_t(2)*capacity*H,sizeof(half)));
         // Gate/up inputs die before the down projection. Their combined FP16
         // arena exactly fits the FP32 down output; stream order owns reuse.
         down=reinterpret_cast<float*>(input);
-        gu=static_cast<float*>(take(2*rows*F,sizeof(float)));
-        hidden=static_cast<half*>(take(rows*F,sizeof(half)));
+        gu=static_cast<float*>(take(size_t(2)*capacity*F,sizeof(float)));
+        hidden=static_cast<half*>(take(size_t(capacity)*F,sizeof(half)));
         bytes=(bytes+255)&~size_t(255);
     }
 };
 void check(cudaError_t e) { if(e!=cudaSuccess) throw std::runtime_error(std::string("K12 grouped: ")+cudaGetErrorString(e)); }
+__global__ void remap_routes(const int* ids,const int* map,int rows,int first,int groups,int* filtered) {
+    const int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=rows) return;
+    const int e=ids[row];
+    if(e==-1) { filtered[row]=-1;return; }
+    if(e<0 || e>=384) { __trap();return; }
+    const int local=map[e]-first;
+    filtered[row]=local>=0 && local<groups ? local : -1;
+}
 __global__ void count_routes(const int* ids,int rows,int groups,int* counts) {
     const int r=blockIdx.x*blockDim.x+threadIdx.x;if(r>=rows) return;
     const int e=ids[r];assert(e>=-1 && e<groups);if(e>=0) atomicAdd(counts+e,1);
 }
-__global__ void plan(int groups,const int* counts,int* offsets,int* cursor,Job* jobs,int max_jobs,int* active) {
+__global__ void plan(int groups,const int* counts,int* offsets,int* cursor,Job* jobs,int max_jobs,int* active,int capacity) {
     if(threadIdx.x) return;
+    int total=0;for(int e=0;e<groups;++e) total+=counts[e];
+    if(total>capacity) { __trap();return; }
     int first=0,j=0,n=0;
     for(int e=0;e<groups;++e) {
         offsets[e]=cursor[e]=first;const int count=counts[e];if(count) ++n;
@@ -199,6 +209,7 @@ __global__ void reduce(const int* ids,const int* reverse,int topk,const float* d
         }
     }
     __syncthreads();
+    if(!count) return;
     for(int d=lane;d<128;d+=32) {
         float value=out[size_t(token)*H+off+d];
         for(int j=0;j<count;++j) value+=down[size_t(reverse[token*topk+order[j]])*H+off+d];
@@ -207,28 +218,38 @@ __global__ void reduce(const int* ids,const int* reverse,int topk,const float* d
 }
 } // namespace grouped
 
-size_t exl3_moe_grouped_workspace_bytes(int tokens,int topk,int groups) {
+void exl3_moe_remap_routes(const int32_t* ids,const int32_t* map,int rows,int first,int groups,
+                           int32_t* filtered,cudaStream_t stream) {
+    if(!ids || !map || !filtered || rows<1 || first<0 || first>=384 || groups<1 || groups>384-first)
+        throw std::invalid_argument("K12 grouped: invalid expert wave");
+    grouped::remap_routes<<<(rows+255)/256,256,0,stream>>>(ids,map,rows,first,groups,filtered);
+    grouped::check(cudaGetLastError());
+}
+
+size_t exl3_moe_grouped_workspace_bytes(int tokens,int topk,int groups,int active_rows) {
     if(tokens<1 || tokens>1024 || topk<1 || topk>6 || groups<1 || groups>384)
         throw std::invalid_argument("K12 grouped: expected tokens 1..1024, topk 1..6, groups 1..384");
-    return grouped::Buffers(nullptr,tokens,topk,groups).bytes;
+    if(active_rows<0 || active_rows>tokens*topk) throw std::invalid_argument("K12 grouped: invalid active row capacity");
+    return grouped::Buffers(nullptr,tokens,topk,groups,active_rows?active_rows:tokens*topk).bytes;
 }
 void exl3_moe_prefill_grouped(const __half* x,const int32_t* ids,const float* weights,int tokens,int topk,
                              const Exl3Expert* experts,const int32_t* residency,int groups,float* out,
-                             void* workspace,size_t bytes,int32_t* active_groups,cudaStream_t stream) {
-    const size_t required=exl3_moe_grouped_workspace_bytes(tokens,topk,groups);
+                              void* workspace,size_t bytes,int32_t* active_groups,cudaStream_t stream,int active_rows) {
+    const size_t required=exl3_moe_grouped_workspace_bytes(tokens,topk,groups,active_rows);
     if(!x || !ids || !weights || !experts || !out || !workspace || reinterpret_cast<uintptr_t>(workspace)%256 || bytes<required)
         throw std::invalid_argument("K12 grouped: invalid buffers or workspace");
-    const int rows=tokens*topk;grouped::Buffers b(workspace,tokens,topk,groups);
+    const int rows=tokens*topk,capacity=active_rows?active_rows:rows;
+    grouped::Buffers b(workspace,tokens,topk,groups,capacity);
     grouped::check(cudaMemsetAsync(b.counts,0,groups*sizeof(int),stream));
     grouped::count_routes<<<(rows+255)/256,256,0,stream>>>(ids,rows,groups,b.counts);
-    grouped::plan<<<1,1,0,stream>>>(groups,b.counts,b.offsets,b.cursor,b.jobs,b.max_jobs,active_groups);
+    grouped::plan<<<1,1,0,stream>>>(groups,b.counts,b.offsets,b.cursor,b.jobs,b.max_jobs,active_groups,capacity);
     grouped::scatter_routes<<<(rows+255)/256,256,0,stream>>>(ids,rows,b.cursor,b.slots,b.reverse,b.labels);
-    grouped::gather_had<<<dim3(rows*2,grouped::H/128),32,0,stream>>>(x,b.slots,b.labels,b.offsets,groups,topk,experts,residency,b.input,rows);
+    grouped::gather_had<<<dim3(capacity*2,grouped::H/128),32,0,stream>>>(x,b.slots,b.labels,b.offsets,groups,topk,experts,residency,b.input,capacity);
     grouped::project<0><<<dim3(grouped::F/128,b.max_jobs),256,0,stream>>>(b.input,b.gu,b.jobs,experts,residency);
-    grouped::project<1><<<dim3(grouped::F/128,b.max_jobs),256,0,stream>>>(b.input+size_t(rows)*grouped::H,b.gu+size_t(rows)*grouped::F,b.jobs,experts,residency);
-    grouped::activate<<<dim3(rows,grouped::F/128),32,0,stream>>>(b.slots,b.labels,b.offsets,groups,weights,experts,residency,b.gu,b.hidden,rows);
+    grouped::project<1><<<dim3(grouped::F/128,b.max_jobs),256,0,stream>>>(b.input+size_t(capacity)*grouped::H,b.gu+size_t(capacity)*grouped::F,b.jobs,experts,residency);
+    grouped::activate<<<dim3(capacity,grouped::F/128),32,0,stream>>>(b.slots,b.labels,b.offsets,groups,weights,experts,residency,b.gu,b.hidden,capacity);
     grouped::project<2><<<dim3(grouped::H/128,b.max_jobs),256,0,stream>>>(b.hidden,b.down,b.jobs,experts,residency);
-    grouped::finish_down<<<dim3(rows,grouped::H/128),32,0,stream>>>(b.labels,b.offsets,groups,experts,residency,b.down);
+    grouped::finish_down<<<dim3(capacity,grouped::H/128),32,0,stream>>>(b.labels,b.offsets,groups,experts,residency,b.down);
     grouped::reduce<<<dim3(tokens,grouped::H/128),32,0,stream>>>(ids,b.reverse,topk,b.down,out);
     grouped::check(cudaGetLastError());
 }

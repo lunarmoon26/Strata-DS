@@ -2,14 +2,18 @@
 #include "strata/ds41/vram_experts.hpp"
 #include "strata/ds41/bounded_upload.hpp"
 #include "strata/ds41/tensor_shards.hpp"
+#include "strata/ds41/ops.hpp"
 
 #include "strata/ds41/config.hpp"
 #include "strata/ds41/residency.hpp"
 #include "strata/ds41/host_experts.hpp"
+#include "strata/ds41/verify.hpp"
 
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <charconv>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -37,6 +41,54 @@ void unmap_pack_pages(const Pack& pack) {
 }
 
 }  // namespace
+
+size_t experimental_decode_cache_bytes(const char* value) {
+    if (!value) return 0;
+    unsigned mib = 0;
+    const char* end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, mib);
+    if (result.ec != std::errc{} || result.ptr != end || mib > 8192)
+        throw std::invalid_argument("DS41_EXPERIMENTAL_DECODE_CACHE_MIB must be an integer in 0..8192");
+    return size_t(mib) << 20;
+}
+
+size_t experimental_ram_cache_bytes(const char* value) {
+    if (!value) return 0;
+    unsigned mib = 0;
+    const char* end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, mib);
+    if (result.ec != std::errc{} || result.ptr != end || mib > 16384 || mib % 2)
+        throw std::invalid_argument("DS41_EXPERIMENTAL_RAM_CACHE_MIB must be an even integer in 0..16384");
+    return size_t(mib) << 20;
+}
+
+size_t experimental_ram_cache_stage_bytes(const char* split, size_t total_bytes, int rank) {
+    if(rank<0 || rank>1 || total_bytes>(16384ull<<20)) throw std::invalid_argument("invalid RAM cache total/rank");
+    if(!split) return total_bytes/2;
+    const char* comma=std::strchr(split,',');const char* end=split+std::strlen(split);
+    unsigned mib[2]={};
+    if(!comma) throw std::invalid_argument("DS41_EXPERIMENTAL_RAM_CACHE_SPLIT requires A,B MiB");
+    const auto a=std::from_chars(split,comma,mib[0]),b=std::from_chars(comma+1,end,mib[1]);
+    if(a.ec!=std::errc{} || a.ptr!=comma || b.ec!=std::errc{} || b.ptr!=end || mib[0]>16384 || mib[1]>16384 ||
+       ((size_t(mib[0])+mib[1])<<20)!=total_bytes)
+        throw std::invalid_argument("DS41_EXPERIMENTAL_RAM_CACHE_SPLIT must sum to the total RAM cache MiB budget");
+    return size_t(mib[rank])<<20;
+}
+
+int experimental_resident_slot_limit(const char* value, int rank) {
+    if (rank < 0 || rank > 1) throw std::invalid_argument("invalid experimental logical rank");
+    if (!value) return -1;
+    const char* comma = std::strchr(value, ',');
+    const char* end = value + std::strlen(value);
+    int counts[2] = {};
+    if (!comma) throw std::invalid_argument("DS41_EXPERIMENTAL_RESIDENT_SLOTS requires two positive counts");
+    const auto a = std::from_chars(value, comma, counts[0]);
+    const auto b = std::from_chars(comma + 1, end, counts[1]);
+    if (a.ec != std::errc{} || a.ptr != comma || b.ec != std::errc{} || b.ptr != end ||
+        counts[0] < 1 || counts[1] < 1 || counts[0] > 15360 || counts[1] > 15360)
+        throw std::invalid_argument("DS41_EXPERIMENTAL_RESIDENT_SLOTS requires two counts in 1..15360");
+    return counts[rank];
+}
 
 std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, int n_layers, int n_experts) {
     std::ifstream f(path, std::ios::binary);
@@ -104,11 +156,25 @@ std::vector<ExpertSwap> plan_expert_swaps(const std::vector<float>& usage, const
 }
 
 VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int64_t n_slots, size_t reserve_bytes,
-                         Adapt adapt, int first_layer, int end_layer, bool require_all, int tensor_rank)
-    : pack_(pack), adapt_(adapt) {
+                          Adapt adapt, int first_layer, int end_layer, bool require_all, int tensor_rank, bool bounded_misses,
+                          size_t decode_cache_bytes, size_t ram_cache_bytes, bool async_cached_routes)
+    : pack_(pack), adapt_(adapt), tensor_rank_(tensor_rank) {
     try {
         const int L = pack.n_layers(), E = pack.n_experts();
+        if (bounded_misses && (!require_all || !pack.experimental_29()))
+            throw std::invalid_argument("bounded expert misses require the experimental 2.9 layer profile");
+        if (decode_cache_bytes && (!bounded_misses || decode_cache_bytes > (8192ull << 20)))
+            throw std::invalid_argument("decode expert cache requires bounded experimental 2.9 and at most 8192 MiB");
+        if (ram_cache_bytes && (!bounded_misses || ram_cache_bytes > (16384ull << 20)))
+            throw std::invalid_argument("RAM expert cache requires bounded experimental 2.9 and at most 16384 MiB/stage");
+        if (async_cached_routes && (!bounded_misses || tensor_rank >= 0))
+            throw std::invalid_argument("async cached routes require bounded experimental layer split");
+        const char* exact_slots = std::getenv("DS41_EXPERIMENTAL_RESIDENT_SLOTS");
+        if (exact_slots && !bounded_misses)
+            throw std::invalid_argument("DS41_EXPERIMENTAL_RESIDENT_SLOTS requires experimental bounded experts");
+        const int slot_limit = experimental_resident_slot_limit(exact_slots, tensor_rank >= 0 ? tensor_rank : first_layer == 0 ? 0 : 1);
         if (end_layer < 0) end_layer = L;
+        first_layer_=first_layer;end_layer_=end_layer;
         if (first_layer < 0 || end_layer > L || first_layer >= end_layer)
             throw std::invalid_argument("ds41 vram: invalid stage layer range");
         if (require_all && (adapt.every != 0 || n_slots != -1))
@@ -116,7 +182,18 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
         if (tensor_rank != -1 && (tensor_rank < 0 || tensor_rank > 1 || !require_all || !pack.has_exl3_dense() || pack.has_mcg()))
             throw std::invalid_argument("TP2 expert residency requires rank 0/1, all slots and full mul1 EXL3");
         ck(cudaGetDevice(&device_), "cudaGetDevice");
+        if (async_cached_routes)
+            ck(cudaHostAlloc((void**)&async_routes_, kVerifyMaxResidentTokens*kTopK*sizeof(int32_t), cudaHostAllocPortable),
+               "async cached route buffer");
         res_host_.assign((size_t) L * E, -1);
+        if(const char* mode=std::getenv("DS41_EXPERIMENTAL_CACHE_FREQUENCY")) {
+            if(std::strcmp(mode,"0") && std::strcmp(mode,"1"))
+                throw std::invalid_argument("DS41_EXPERIMENTAL_CACHE_FREQUENCY must be 0 or 1");
+            frequency_cache_=!std::strcmp(mode,"1");
+        }
+        if(frequency_cache_ && (!bounded_misses || tensor_rank>=0))
+            throw std::invalid_argument("frequency cache requires bounded layer split");
+        if(frequency_cache_) route_frequency_.assign((size_t)L*E,0);
         usage_.assign((size_t) L * E, 0.0f);
         ck(cudaMalloc(&res_dev_, res_host_.size() * sizeof(int32_t)), "residency table");
         ck(cudaMalloc(&ws_, kWorkspaceBytes), "K10 workspace");
@@ -143,12 +220,17 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
                 n_slots = 0;
                 for (const auto& [l, e] : ranked) {
                     if (slot_size(l, e) > room - used) {
-                        if (require_all) throw std::runtime_error("ds41 vram: all stage experts do not fit with the VRAM reserve; refusing CPU fallback");
+                        if (require_all && !bounded_misses) throw std::runtime_error("ds41 vram: all stage experts do not fit with the VRAM reserve; refusing CPU fallback");
                         break;
                     }
                     used += slot_size(l, e);
                     ++n_slots;
                 }
+            }
+            if (slot_limit >= 0) {
+                if (slot_limit > n_slots || size_t(slot_limit) > ranked.size())
+                    throw std::runtime_error("fixed experimental resident set does not fit; refusing to silently shrink it");
+                n_slots = slot_limit;
             }
             slots_ = (int) std::min<int64_t>(n_slots, (int64_t) ranked.size());
             for (int s = 0; s < slots_; ++s) {
@@ -157,7 +239,7 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
             }
             if (slots_ > 0) {
                 ck(cudaMalloc(&arena_, off_.back()), "expert slots");
-                desc_host_.resize(slots_);
+                desc_host_.resize(slots_ + (bounded_misses ? kTopK : 0));
                 const uint8_t* base = pack.expert_base();
                 std::unique_ptr<BoundedUpload> upload;
                 if (require_all) upload = std::make_unique<BoundedUpload>(pack.dir() + "/experts.bin");
@@ -179,12 +261,60 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
                     publish_residency(res_host_[(size_t) l * E + e], s);
                 }
                 if (!upload) unmap_pack_pages(pack);
-                ck(cudaMalloc(&experts_dev_, desc_host_.size() * sizeof(desc_host_[0])), "expert descriptors");
-                ck(cudaMemcpy(experts_dev_, desc_host_.data(), desc_host_.size() * sizeof(desc_host_[0]),
-                              cudaMemcpyHostToDevice),
-                   "expert descriptors");
             }
         }
+        if (bounded_misses) {
+            for (int l = first_layer; l < end_layer; ++l)
+                for (int e = 0; e < E; ++e) max_slot_bytes_ = std::max(max_slot_bytes_, slot_size(l, e));
+            if (!slots_) {
+                desc_host_.resize(kTopK);
+            }
+            ck(cudaMalloc(&miss_arena_, kTopK * max_slot_bytes_), "bounded selected-expert staging");
+            miss_upload_ = std::make_unique<BoundedUpload>(pack.dir() + "/experts.bin");
+            if (ram_cache_bytes) {
+                size_t cold_count=0;
+                for (int l = first_layer; l < end_layer; ++l)
+                    for (int e = 0; e < E; ++e) {
+                        ram_slot_bytes_ = std::max(ram_slot_bytes_, size_t((pack.expert(l, e).bytes + 4095) / 4096 * 4096));
+                        cold_count += res_host_[size_t(l)*E+e]<0;
+                    }
+                const size_t count = std::min(ram_cache_bytes / ram_slot_bytes_, cold_count);
+                if (!count && cold_count) throw std::invalid_argument("RAM cache budget cannot hold one complete expert");
+                if (count) {
+                ck(cudaHostAlloc(&ram_arena_, count * ram_slot_bytes_, cudaHostAllocPortable), "bounded pinned RAM expert cache");
+                ram_cache_.resize(count);
+                ram_lookup_.assign(size_t(L) * E, -1);
+                std::fprintf(stderr, "ds41 experimental RAM cache: %zu slots, %.3f GiB/stage, GPU computation only\n",
+                             count, count * ram_slot_bytes_ / 1073741824.);
+                }
+            }
+            if (decode_cache_bytes) {
+                const size_t count = std::min(decode_cache_bytes / max_slot_bytes_, size_t(L) * E);
+                if (!count) throw std::invalid_argument("decode cache budget cannot hold one complete expert");
+                const size_t bytes = count * max_slot_bytes_;
+                size_t free_bytes = 0, total_bytes = 0;
+                ck(cudaMemGetInfo(&free_bytes, &total_bytes), "decode cache free memory");
+                if (bytes > free_bytes || free_bytes - bytes < (512ull << 20))
+                    throw std::runtime_error("decode cache budget leaves less than 512 MiB free; reduce it");
+                ck(cudaMalloc(&miss_cache_arena_, bytes), "bounded decode expert cache");
+                miss_cache_.resize(count);
+                miss_cache_lookup_.assign(size_t(L) * E, -1);
+                desc_host_.resize(slots_ + kTopK + count);
+                std::fprintf(stderr, "ds41 experimental decode cache: %zu slots, %.3f GiB/device, immutable weights only\n",
+                             count, bytes / 1073741824.);
+            }
+            std::fprintf(stderr, "ds41 experimental expert stream: %d/%zu resident, %.3f GiB selected-expert staging; no CPU experts\n",
+                         slots_, size_t(end_layer - first_layer) * E, kTopK * max_slot_bytes_ / 1073741824.);
+        }
+        if (!desc_host_.empty()) {
+            ck(cudaMalloc(&experts_dev_, desc_host_.size() * sizeof(desc_host_[0])), "expert descriptors");
+            ck(cudaMemcpy(experts_dev_, desc_host_.data(), desc_host_.size() * sizeof(desc_host_[0]),
+                          cudaMemcpyHostToDevice), "expert descriptors");
+        }
+        full_layers_.assign(L, 0);
+        for (int l = first_layer; l < end_layer; ++l)
+            full_layers_[l] = std::all_of(res_host_.begin() + size_t(l)*E, res_host_.begin() + size_t(l+1)*E,
+                                           [](int32_t slot) { return slot >= 0; });
         upload_res();
     } catch (...) {
         cleanup();
@@ -195,6 +325,7 @@ VramExperts::VramExperts(const Pack& pack, const std::string& profile_path, int6
 VramExperts::~VramExperts() { cleanup(); }
 
 void VramExperts::cleanup() noexcept {
+    cancel_cached_rows();
     if (copier_.joinable()) copier_.join();
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (staging_) cudaFreeHost(staging_);
@@ -203,6 +334,276 @@ void VramExperts::cleanup() noexcept {
     cudaFree(res_dev_);
     cudaFree(experts_dev_);
     cudaFree(ws_);
+    cudaFree(miss_arena_);
+    cudaFree(miss_cache_arena_);
+    if (!miss_cache_.empty()) std::fprintf(stderr,
+        "ds41 experimental decode cache totals: hits=%lld uploads=%lld evictions=%lld slots=%zu stage=%d..%d\n",
+        (long long)cache_hits_, (long long)streamed_decode_, (long long)cache_evictions_, miss_cache_.size(),first_layer_,end_layer_-1);
+    miss_upload_.reset();
+    if (!ram_cache_.empty()) std::fprintf(stderr,
+        "ds41 experimental RAM cache totals: hits=%lld fills=%lld read_bytes=%llu slots=%zu stage=%d..%d\n",
+        (long long)ram_hits_, (long long)ram_fills_, (unsigned long long)ram_read_bytes_, ram_cache_.size(),first_layer_,end_layer_-1);
+    if (ram_arena_) cudaFreeHost(ram_arena_);
+    // If CUDA cannot drain the copy, retain its pinned target until process
+    // exit rather than freeing memory that might still be in flight.
+    if (async_routes_ && !async_routes_failed_) cudaFreeHost(async_routes_);
+}
+
+const uint8_t* VramExperts::ram_payload(int layer, int expert) {
+    if (ram_cache_.empty()) return nullptr;
+    const int owner = layer * pack_.n_experts() + expert;
+    int slot = ram_lookup_[owner];
+    if (slot >= 0) {
+        ram_cache_[slot].age = ++ram_clock_;
+        ++ram_hits_;
+        return ram_arena_ + size_t(slot) * ram_slot_bytes_;
+    }
+    slot = 0;
+    for (size_t j = 1; j < ram_cache_.size(); ++j)
+        if (ram_cache_[j].age < ram_cache_[slot].age) slot = int(j);
+    auto& entry = ram_cache_[slot];
+    if (entry.owner >= 0) ram_lookup_[entry.owner] = -1;
+    entry = CacheEntry{};
+    const auto& payload = pack_.expert(layer, expert);
+    auto* dst = ram_arena_ + size_t(slot) * ram_slot_bytes_;
+    // A failed or partial read leaves the victim invalid, never a RAM hit.
+    miss_upload_->read_host(dst, payload.offset, payload.bytes);
+    entry = CacheEntry{owner, ++ram_clock_};
+    ram_lookup_[owner] = slot;
+    ++ram_fills_;
+    ram_read_bytes_ += payload.bytes;
+    return dst;
+}
+
+namespace {
+struct CachedSelection { int32_t slots[kVerifyMaxResidentTokens*kTopK]; int n; };
+__global__ void publish_cached_selection(CachedSelection selection,int32_t* selected) {
+    const int i=threadIdx.x;if(i<selection.n) selected[i]=selection.slots[i];
+}
+}
+
+int VramExperts::prefill_gpu_slot(int layer,int expert) const {
+    if(layer<first_layer_ || layer>=end_layer_ || expert<0 || expert>=pack_.n_experts())
+        throw std::invalid_argument("prefill cache lookup outside owned experts");
+    const int owner=layer*pack_.n_experts()+expert;
+    if(res_host_[owner]>=0) return res_host_[owner];
+    const int cached=miss_cache_.empty()?-1:miss_cache_lookup_[owner];
+    return cached<0?-1:slots_+kTopK+cached;
+}
+
+const uint8_t* VramExperts::prefill_ram_source(int layer,int expert) const {
+    if(layer<first_layer_ || layer>=end_layer_ || expert<0 || expert>=pack_.n_experts())
+        throw std::invalid_argument("prefill RAM lookup outside owned experts");
+    if(ram_cache_.empty()) return nullptr;
+    const int slot=ram_lookup_[layer*pack_.n_experts()+expert];
+    return slot<0?nullptr:ram_arena_+size_t(slot)*ram_slot_bytes_;
+}
+
+VramExperts::PrefillPrime VramExperts::prime_prefill_cache() {
+    if(!miss_upload_ || lent_ || tensor_rank_>=0 || pending_rows_.active || async_routes_failed_)
+        throw std::invalid_argument("prefill cache priming requires idle bounded layer split");
+    ck(cudaDeviceSynchronize(),"prefill cache idle fence");
+    PrefillPrime stats;
+    int empty=0;
+    try {
+        for(int l=first_layer_;l<end_layer_;++l) for(int e=0;e<pack_.n_experts();++e) {
+            if(prefill_gpu_slot(l,e)>=0) continue;
+            while(empty<int(miss_cache_.size()) && miss_cache_[empty].owner>=0) ++empty;
+            if(empty==int(miss_cache_.size())) break;
+            const auto& payload=pack_.expert(l,e);
+            const int slot=slots_+kTopK+empty;uint8_t* dst=miss_cache_arena_+size_t(empty)*max_slot_bytes_;
+            if(const auto* source=prefill_ram_source(l,e)) miss_upload_->set_source(source,payload.offset,payload.bytes);
+            try { miss_upload_->copy(dst,payload.offset,payload.bytes); }
+            catch(...) { miss_upload_->clear_source();throw; }
+            miss_upload_->clear_source();
+            desc_host_[slot]=describe_at(pack_,l,e,dst);
+            ck(cudaMemcpy(experts_dev_+slot,desc_host_.data()+slot,sizeof(kernels::Exl3Expert),cudaMemcpyHostToDevice),"prefill cache descriptor");
+            ck(cudaStreamSynchronize(nullptr),"prefill cache descriptor fence");
+            const int owner=l*pack_.n_experts()+e;
+            miss_cache_[empty]=CacheEntry{owner,++cache_clock_};miss_cache_lookup_[owner]=empty;
+            ++empty;++stats.gpu_fills;stats.bytes+=payload.bytes;
+        }
+        int available=0;for(const auto& entry:ram_cache_) available+=entry.owner<0;
+        for(int l=first_layer_;l<end_layer_ && available;++l) for(int e=0;e<pack_.n_experts() && available;++e) {
+            if(prefill_gpu_slot(l,e)>=0 || prefill_ram_source(l,e)) continue;
+            ram_payload(l,e);--available;++stats.ram_fills;stats.bytes+=pack_.expert(l,e).bytes;
+        }
+    } catch(...) { miss_upload_->clear_source();throw; }
+    return stats;
+}
+
+bool VramExperts::try_cached_rows(int layer,const int32_t* ids,int rows,int topk,int32_t* selected,cudaStream_t stream) {
+    if(!miss_upload_ || lent_ || pending_rows_.active || async_routes_failed_ || layer<first_layer_ || layer>=end_layer_ || !ids || !selected ||
+       rows<1 || rows>kVerifyMaxResidentTokens || topk<1 || topk>kTopK)
+        throw std::invalid_argument("invalid cache-hit row batch");
+    cudaStreamCaptureStatus capture;
+    ck(cudaStreamIsCapturing(stream,&capture),"cached rows capture status");
+    if(capture!=cudaStreamCaptureStatusNone) throw std::invalid_argument("cached rows require eager route admission");
+    const int n=rows*topk;int32_t routes[kVerifyMaxResidentTokens*kTopK];
+    ck(cudaMemcpyAsync(routes,ids,n*sizeof(int32_t),cudaMemcpyDeviceToHost,stream),"cached rows route read");
+    ck(cudaStreamSynchronize(stream),"cached rows prior-consumer fence");
+    return resolve_cached_rows(layer,routes,n,selected,stream);
+}
+
+void VramExperts::begin_cached_rows(int layer,const int32_t* ids,int rows,int topk,int32_t* selected,cudaStream_t stream) {
+    if(!async_routes_ || async_routes_failed_ || pending_rows_.active || !miss_upload_ || lent_ || layer<first_layer_ || layer>=end_layer_ ||
+       !ids || !selected || rows<1 || rows>kVerifyMaxResidentTokens || topk<1 || topk>kTopK)
+        throw std::invalid_argument("invalid asynchronous cached-row read");
+    cudaStreamCaptureStatus capture;
+    ck(cudaStreamIsCapturing(stream,&capture),"async cached rows capture status");
+    if(capture!=cudaStreamCaptureStatusNone) throw std::invalid_argument("async cached rows require eager route admission");
+    const int n=rows*topk;
+    const auto status=cudaMemcpyAsync(async_routes_,ids,n*sizeof(int32_t),cudaMemcpyDeviceToHost,stream);
+    if(status!=cudaSuccess) {
+        if(cudaStreamSynchronize(stream)!=cudaSuccess) async_routes_failed_=true;
+        ck(status,"async cached rows route read");
+    }
+    pending_rows_={layer,n,selected,stream,true};
+    ++async_cached_row_reads_;
+}
+
+bool VramExperts::finish_cached_rows() {
+    if(!pending_rows_.active) throw std::logic_error("no asynchronous cached-row read");
+    const auto read=pending_rows_;
+    ck(cudaStreamSynchronize(read.stream),"async cached rows prior-consumer fence");
+    pending_rows_=PendingRows{};
+    return resolve_cached_rows(read.layer,async_routes_,read.count,read.selected,read.stream);
+}
+
+void VramExperts::cancel_cached_rows() noexcept {
+    if (!pending_rows_.active) return;
+    if(cudaStreamSynchronize(pending_rows_.stream)!=cudaSuccess) async_routes_failed_=true;
+    pending_rows_=PendingRows{};
+}
+
+bool VramExperts::resolve_cached_rows(int layer,const int32_t* routes,int n,int32_t* selected,cudaStream_t stream) {
+    // Validate every route before returning a miss or touching cache ages.
+    for(int i=0;i<n;++i) if(routes[i]<0 || routes[i]>=pack_.n_experts())
+        throw std::runtime_error("invalid cached-row expert id");
+    CachedSelection selection{};selection.n=n;
+    for(int i=0;i<n;++i) {
+        const int owner=layer*pack_.n_experts()+routes[i];
+        const int resident=res_host_[owner];
+        if(resident>=0) { selection.slots[i]=resident;continue; }
+        const int cached=miss_cache_.empty()?-1:miss_cache_lookup_[owner];
+        if(cached<0) return false;
+        selection.slots[i]=slots_+kTopK+cached;
+    }
+    // Every descriptor already exists; no allocation, eviction or payload copy.
+    // A later miss admission fences this stream before reusing a selected slot.
+    publish_cached_selection<<<1,64,0,stream>>>(selection,selected);
+    ck(cudaGetLastError(),"cached rows selection publication");
+    for(int i=0;i<n;++i) if(selection.slots[i]>=slots_+kTopK) {
+        miss_cache_[selection.slots[i]-slots_-kTopK].age=++cache_clock_;++cache_hits_;
+    }
+    ++cached_row_batches_;
+    if(frequency_cache_) for(int i=0;i<n;++i) ++route_frequency_[layer*pack_.n_experts()+routes[i]];
+    return true;
+}
+
+void VramExperts::prepare_decode(int layer, const int32_t* ids, int topk, int32_t* selected, cudaStream_t stream,
+                                bool resident_fastpath) {
+    if (!miss_upload_ || pending_rows_.active || async_routes_failed_ || layer < first_layer_ || layer >= end_layer_ || topk < 1 || topk > kTopK)
+        throw std::invalid_argument("invalid bounded expert decode staging");
+    if (resident_fastpath && topk == kTopK && fully_resident_layer(layer)) {
+        // Static descriptors are immutable and the consumer is on this stream.
+        // No upload, eviction, host route copy or publication fence is needed.
+        ops::resident_routes(ids, res_dev_ + size_t(layer) * pack_.n_experts(), selected, stream);
+        return;
+    }
+    int32_t routes[kTopK], slots[kTopK];
+    ck(cudaMemcpyAsync(routes, ids, topk * sizeof(int32_t), cudaMemcpyDeviceToHost, stream), "stream selected routes");
+    ck(cudaStreamSynchronize(stream), "stream prior-consumer fence");
+    // Validate the whole group before an eviction or payload access. Cached
+    // selections later in route order must survive earlier misses in this call.
+    std::vector<uint8_t> protected_slots(miss_cache_.size(), 0);
+    for (int i = 0; i < topk; ++i) {
+        if (routes[i] < 0 || routes[i] >= pack_.n_experts()) throw std::runtime_error("invalid streamed expert id");
+        if (!miss_cache_.empty()) {
+            const int cached = miss_cache_lookup_[size_t(layer) * pack_.n_experts() + routes[i]];
+            if (cached >= 0) protected_slots[cached] = 1;
+        }
+    }
+    std::vector<int> publish;
+    if(frequency_cache_) for(int i=0;i<topk;++i) ++route_frequency_[layer*pack_.n_experts()+routes[i]];
+    try {
+    for (int i = 0; i < topk; ++i) {
+        const int e = routes[i];
+        if (e < 0 || e >= pack_.n_experts()) throw std::runtime_error("invalid streamed expert id");
+        slots[i] = res_host_[size_t(layer) * pack_.n_experts() + e];
+        if (slots[i] >= 0) continue;
+        const int owner = layer * pack_.n_experts() + e;
+        if (!miss_cache_.empty()) {
+            const int cached = miss_cache_lookup_[owner];
+            if (cached >= 0) {
+                slots[i] = slots_ + kTopK + cached;
+                miss_cache_[cached].age = ++cache_clock_;
+                protected_slots[cached] = 1;
+                ++cache_hits_;
+                continue;
+            }
+        }
+        const auto& x = pack_.expert(layer, e);
+        uint8_t* target = miss_arena_ + size_t(i) * max_slot_bytes_;
+        slots[i] = slots_ + i;
+        int victim = -1;
+        for (size_t j = 0; j < miss_cache_.size(); ++j) {
+            if(protected_slots[j]) continue;
+            auto rank=[&](int slot) {
+                const int o=miss_cache_[slot].owner;
+                return frequency_cache_ && o>=0 ? route_frequency_[o] : uint64_t(0);
+            };
+            if(victim<0 || rank(int(j))<rank(victim) ||
+               (rank(int(j))==rank(victim) && miss_cache_[j].age<miss_cache_[victim].age)) victim=int(j);
+        }
+        // A cold one-off route uses its staging slot instead of evicting a
+        // repeatedly useful expert. The consumer arithmetic is identical.
+        if(frequency_cache_ && victim>=0 && miss_cache_[victim].owner>=0 &&
+           route_frequency_[owner]<=route_frequency_[miss_cache_[victim].owner]) victim=-1;
+        if (victim >= 0) {
+            auto& entry = miss_cache_[victim];
+            if (entry.owner >= 0) { miss_cache_lookup_[entry.owner] = -1; ++cache_evictions_; }
+            entry = CacheEntry{};
+            target = miss_cache_arena_ + size_t(victim) * max_slot_bytes_;
+            slots[i] = slots_ + kTopK + victim;
+        }
+        if (const auto* source = ram_payload(layer, e)) miss_upload_->set_source(source, x.offset, x.bytes);
+        try {
+            if (tensor_rank_ >= 0)
+                desc_host_[slots[i]] = upload_tensor_expert(*miss_upload_, x, target, tensor_rank_);
+            else {
+                miss_upload_->copy(target, x.offset, x.bytes);
+                desc_host_[slots[i]] = describe_at(pack_, layer, e, target);
+            }
+        } catch (...) { miss_upload_->clear_source(); throw; }
+        miss_upload_->clear_source();
+        if (victim >= 0) {
+            miss_cache_[victim] = CacheEntry{owner, ++cache_clock_};
+            miss_cache_lookup_[owner] = victim;
+            protected_slots[victim] = 1;
+        }
+        if (!miss_cache_.empty()) publish.push_back(slots[i]);
+        ++streamed_decode_;
+    }
+    // Pageable-host cudaMemcpy on the default stream does not order a
+    // nonblocking consumer stream. Publish on that consumer's stream and fence
+    // before returning the stack-owned selection or reusing host descriptors.
+    if (miss_cache_.empty())
+        ck(cudaMemcpyAsync(experts_dev_ + slots_, desc_host_.data() + slots_, kTopK * sizeof(kernels::Exl3Expert), cudaMemcpyHostToDevice, stream),
+           "stream descriptor publication");
+    else for (int slot : publish)
+        ck(cudaMemcpyAsync(experts_dev_ + slot, desc_host_.data() + slot, sizeof(kernels::Exl3Expert), cudaMemcpyHostToDevice, stream),
+           "cached descriptor publication");
+    ck(cudaMemcpyAsync(selected, slots, topk * sizeof(int32_t), cudaMemcpyHostToDevice, stream), "stream selected publication");
+    ck(cudaStreamSynchronize(stream), "stream publication fence");
+    } catch (...) {
+        // Drain possible stack-owned selection copies before unwind. Earlier
+        // uploads may not have published descriptors; never retain their lookups.
+        cudaStreamSynchronize(stream);
+        std::fill(miss_cache_lookup_.begin(), miss_cache_lookup_.end(), -1);
+        std::fill(miss_cache_.begin(), miss_cache_.end(), CacheEntry{});
+        throw;
+    }
 }
 
 namespace {
@@ -374,6 +775,7 @@ int VramExperts::commit_pending(bool wait) {
 }
 
 int VramExperts::between_steps() {
+    if (pending_rows_.active || async_routes_failed_) throw std::logic_error("ds41 vram experts: cached-row read is pending or failed");
     if (slots_ == 0 || adapt_.every <= 0) return 0;
     if (lent_) throw std::logic_error("ds41 vram experts: a step while slots are lent to prefill");
     const int L = pack_.n_layers(), E = pack_.n_experts();
@@ -408,6 +810,7 @@ int VramExperts::between_steps() {
 }
 
 uint8_t* VramExperts::lend(int n) {
+    if (pending_rows_.active || async_routes_failed_) throw std::logic_error("ds41 vram experts: cached-row read is pending or failed");
     if (lent_) throw std::logic_error("ds41 vram experts: slots already lent");
     if (n < 0 || n > slots_) throw std::invalid_argument("ds41 vram experts: cannot lend that many slots");
     commit_pending(true);
@@ -433,6 +836,7 @@ uint8_t* VramExperts::lend_bytes(size_t bytes) {
 }
 
 void VramExperts::restore() {
+    if (pending_rows_.active || async_routes_failed_) throw std::logic_error("ds41 vram experts: cached-row read is pending or failed");
     if (!lent_) return;
     const int E = pack_.n_experts();
     const uint8_t* base = pack_.expert_base();

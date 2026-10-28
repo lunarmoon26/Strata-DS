@@ -28,6 +28,10 @@ struct Exl3Expert {
 /// m tokens (1..8), topk slots each. For every token t and slot j with sel[t][j] >= 0, e = experts[sel[t][j]]:
 ///   g = W1 x_t, u = W3 x_t (FP32; exllamav3 LinearEXL3 semantics); g = min(g, 10); u = clamp(u, -10, 10)
 ///   h = bf16(silu(g) * u * w[t][j]); h = FP8 block-32 quantize-dequantize(h) (as ops::act_quant_inplace); fp16(h)
+/// uniform_bits is a caller guarantee, not a guess: every selected expert's w1, w3 and w2 use this integer
+/// rate (tile_w = 16 * uniform_bits) with codebook 2. 0 means no guarantee. The hint is only honored behind
+/// DS41_EXPERIMENTAL_EXPERT_RATE_KERNEL=1 and grouped execution is inactive;
+/// a wrong hint silently computes wrong experts.
 ///   out[t] += W2 h (FP32)
 /// With native_qdq=false, h is rounded directly to FP16 without BF16/FP8 QDQ;
 /// the caller also supplies ordinary FP16 input for that published EXL3 profile.
@@ -35,7 +39,7 @@ struct Exl3Expert {
 /// out [m][5120] f32 is accumulated into. workspace: device memory of workspace_bytes (at least 64 MiB).
 /// No allocation, no synchronization (CUDA-graph capturable).
 void exl3_moe_decode(const __half* x, int m, const int32_t* sel, const float* w, int topk, const Exl3Expert* experts,
-                      float* out, void* workspace, size_t workspace_bytes, cudaStream_t stream);
+                      float* out, void* workspace, size_t workspace_bytes, cudaStream_t stream, int uniform_bits = 0);
 
 /// Column-sharded TP2 experts. Gather hidden rows between up/down, then gather
 /// the output rows. Both operations preserve FP16 activation and FP32 reduction.

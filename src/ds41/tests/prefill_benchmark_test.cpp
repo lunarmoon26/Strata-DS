@@ -19,7 +19,7 @@ int main(int argc,char** argv) {
     std::setvbuf(stdout,nullptr,_IOLBF,0);
     try {
         std::string pack,ids,reference_in,reference_out;
-        int capacity=524288,chunk=1024,batch=256,repeat=2,spec=1;
+        int capacity=524288,chunk=1024,batch=256,repeat=2,spec=1,experimental=0;
         for(int i=1;i<argc;i+=2) {
             require(i+1<argc,"missing option value");std::string key=argv[i];
             if(key=="--pack") pack=argv[i+1];
@@ -29,19 +29,23 @@ int main(int argc,char** argv) {
             else if(key=="--batch") batch=std::stoi(argv[i+1]);
             else if(key=="--repeat") repeat=std::stoi(argv[i+1]);
             else if(key=="--spec") spec=std::stoi(argv[i+1]);
+            else if(key=="--experimental-29") experimental=std::stoi(argv[i+1]);
             else if(key=="--reference-in") reference_in=argv[i+1];
             else if(key=="--reference-out") reference_out=argv[i+1];
             else throw std::invalid_argument("unknown option "+key);
         }
         require(repeat>=1 && repeat<=5 && chunk>=16 && chunk<=1024 && batch>=1 && batch<=512,"benchmark bounds");
+        require((experimental==0 || experimental==1) && (!experimental || !spec),"experimental benchmark requires spec=0");
         std::ifstream input(ids);require(bool(input),"missing prompt");std::string value;std::vector<int> prompt;
         while(std::getline(input,value,',')) if(!value.empty()) prompt.push_back(std::stoi(value));
         require(!prompt.empty() && prompt.size()+32<=size_t(capacity),"prompt/capacity bounds");
         EngineOptions o;o.devices={0,1};o.split_layer=18;o.max_seq=capacity;o.cpu_threads=2;
         o.ram_budget_gib=0;o.adapt_every=0;o.prefill_chunk=chunk;o.prefill_batch=batch;
-        o.vram_reserve_bytes=1ull<<30;o.snapshots=1;o.dspark=spec;
+        o.vram_reserve_bytes=(experimental?12ull:1ull)<<30;o.snapshots=1;o.dspark=spec;
         Engine e(pack,o);std::vector<double> times;std::vector<float> first;
-        require(e.vram_expert_slots()==kLayers*kExperts,"not all backbone experts resident");
+        require(experimental ? e.vram_expert_slots()<kLayers*kExperts : e.vram_expert_slots()==kLayers*kExperts,
+                "unexpected benchmark residency");
+        std::printf("LOADED resident_slots=%d experimental_29=%d\n",e.vram_expert_slots(),experimental);
         int next=-1;
         for(int round=0;round<=repeat;++round) {
             e.reset();require(e.position()==0,"reset position");
@@ -53,9 +57,11 @@ int main(int argc,char** argv) {
             else require(!std::memcmp(first.data(),logits.data(),kVocab*sizeof(float)),"prefill replay differs");
             if(round) times.push_back(seconds);
             const auto& t=e.last_prefill();
-            std::printf("PREFILL warmup=%d tokens=%zu seconds=%.6f tok_s=%.3f chunk=%d batch=%d engram_wait_ms=%.3f unique_engram_rows=%lld resident_groups=%lld streamed=%lld\n",
+            std::printf("PREFILL warmup=%d tokens=%zu seconds=%.6f tok_s=%.3f chunk=%d batch=%d engram_wait_ms=%.3f unique_engram_rows=%lld resident_groups=%lld streamed=%lld expert_graph_captures=%llu expert_graph_replays=%llu cached_gpu_groups=%llu cache_prime_ms=%.3f\n",
                 round==0,prompt.size(),seconds,prompt.size()/seconds,t.chunk_tokens,t.sub_batch,t.engram_ms,
-                (long long)t.engram_unique,(long long)t.vram_experts,(long long)t.streamed);
+                 (long long)t.engram_unique,(long long)t.vram_experts,(long long)t.streamed,
+                  (unsigned long long)t.expert_graph_captures,(unsigned long long)t.expert_graph_replays,
+                  (unsigned long long)t.prefill_cached_gpu_groups,t.prefill_cache_prime_ms);
         }
         if(!reference_out.empty()) {
             std::ofstream f(reference_out,std::ios::binary);f.write(reinterpret_cast<const char*>(first.data()),kVocab*sizeof(float));require(bool(f),"reference output");
@@ -70,7 +76,8 @@ int main(int argc,char** argv) {
             const double rel=std::sqrt(err/std::max(norm,1e-30));
             const int expected_next=int(std::max_element(expected.begin(),expected.end())-expected.begin());
             std::printf("REFERENCE argmax=%d/%d rel_l2=%.9g kl=%.9g byte_identical=%d\n",next,expected_next,rel,kl,!std::memcmp(first.data(),expected.data(),kVocab*sizeof(float)));
-            require(next==expected_next && std::isfinite(kl) && kl<.02 && rel<.25,"predictive reference differs");
+            require(next==expected_next && std::isfinite(kl) && kl<(experimental?.002:.02) && rel<(experimental?.01:.25),
+                    "predictive reference differs");
         }
         e.save_snapshot(0);const int position=e.position(),after=e.step(next,position);const auto continuation=e.last_logits();
         e.restore_snapshot(0);require(e.step(next,position)==after && e.last_logits()==continuation,"snapshot continuation differs");

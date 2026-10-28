@@ -20,8 +20,10 @@ void ck(cudaError_t e, const char* what) {
 }  // namespace
 
 ExpertStream::ExpertStream(const Pack& pack, const HostExperts* host, uint8_t* ring, int slots, size_t slot_bytes,
-                           int readers, int host_buffers, bool unbuffered)
-    : pack_(pack), host_(host), ring_(ring), slots_(slots), n_host_(host_buffers), slot_bytes_(slot_bytes) {
+                           int readers, int host_buffers, bool unbuffered,
+                           std::function<const uint8_t*(int,int)> frozen_ram_source)
+    : pack_(pack), host_(host), frozen_ram_source_(std::move(frozen_ram_source)),
+      ring_(ring), slots_(slots), n_host_(host_buffers), slot_bytes_(slot_bytes) {
     try {
         if (slots < 1 || readers < 1 || host_buffers < 1)
             throw std::invalid_argument("ds41 expert stream: needs a slot, a reader and a host buffer");
@@ -160,8 +162,9 @@ void ExpertStream::reader() {
             const ExpertSlot& x = pack_.expert(job.first, job.second);
             const int32_t ram = host_ ? host_->slot_of(job.first, job.second) : -1;
             const uint8_t* src;
-            if (ram >= 0) {   // pinned already: copied from its RAM slot, no staging
-                src = host_->slot_ptr(ram);
+            const uint8_t* frozen=frozen_ram_source_?frozen_ram_source_(job.first,job.second):nullptr;
+            if (ram >= 0 || frozen) {   // immutable pinned source outlives readers and DMA
+                src = frozen?frozen:host_->slot_ptr(ram);
                 ++n_ram_;
             } else {
                 uint8_t* buf = host_buf_[j % n_host_];

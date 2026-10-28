@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace strata::ds41::ops {
 namespace {
@@ -106,6 +107,13 @@ __global__ void embed_k(const bf16* table, int token, bf16* h, const int* token_
     if (d >= kDim) return;
     const bf16 v = table[(int64_t) token * kDim + d];
     for (int c = 0; c < kHc; ++c) h[c * kDim + d] = v;
+}
+
+__global__ void embed_rows_k(const bf16* table, const int* tokens, bf16* h) {
+    const int row = blockIdx.y, d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= kDim) return;
+    const bf16 v = table[int64_t(tokens[row]) * kDim + d];
+    for (int c = 0; c < kHc; ++c) h[(int64_t(row) * kHc + c) * kDim + d] = v;
 }
 
 __global__ void rmsnorm_k(const bf16* x, const bf16* w, bf16* y, int n, float eps) {
@@ -461,7 +469,10 @@ __global__ void to_half_fp8q_k(const bf16* x, uint16_t* out, int n) {
 }
 
 // one block per hc copy: rstd over dim of h[c] and key[c]; gate; h[c] += gate * value
-__global__ void engram_apply_k(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float eps) {
+__device__ float engram_weight(bf16 x) { return bf(x); }
+__device__ float engram_weight(float x) { return x; }
+template<typename Weight>
+__global__ void engram_apply_k(bf16* h, const bf16* kv, const Weight* qw, const Weight* kw, float eps) {
     __shared__ float sh[32];
     const int c = blockIdx.x;
     h += (int64_t) blockIdx.y * kHc * kDim;   // row blockIdx.y
@@ -471,7 +482,7 @@ __global__ void engram_apply_k(bf16* h, const bf16* kv, const bf16* qw, const bf
     float hh = 0.0f, kk = 0.0f, dot = 0.0f;
     for (int d = threadIdx.x; d < kDim; d += blockDim.x) {
         const float hv = bf(h[c * kDim + d]), kvv = bf(key[d]);
-        const float wv = bf(qw[c * kDim + d]) * bf(kw[c * kDim + d]);
+        const float wv = engram_weight(qw[c * kDim + d]) * engram_weight(kw[c * kDim + d]);
         hh += hv * hv;
         kk += kvv * kvv;
         dot += hv * wv * kvv;
@@ -668,6 +679,11 @@ void engram_apply(bf16* h, const bf16* kv, const bf16* qw, const bf16* kw, float
     if (rows > 0) engram_apply_k<<<dim3(kHc, rows), 1024, 0, stream>>>(h, kv, qw, kw, eps);
     LAUNCH_CHECK("engram_apply");
 }
+
+void engram_apply_f32(bf16* h, const bf16* kv, const float* qw, const float* kw, float eps, int rows, cudaStream_t stream) {
+    if (rows > 0) engram_apply_k<<<dim3(kHc, rows), 1024, 0, stream>>>(h, kv, qw, kw, eps);
+    LAUNCH_CHECK("engram_apply_f32");
+}
 void window_index(int pos, int32_t* idx, cudaStream_t stream) {
     window_index_k<<<1, kWindow, 0, stream>>>(pos, idx);
     LAUNCH_CHECK("window_index");
@@ -680,6 +696,12 @@ void engram_dequant(const uint8_t* w, const uint8_t* s, int rows, bf16* out, cud
 void embed_device(const bf16* table, const int* token_dev, bf16* h, cudaStream_t stream) {
     embed_k<<<grid(kDim, 256), 256, 0, stream>>>(table, 0, h, token_dev);
     LAUNCH_CHECK("embed_device");
+}
+void embed_device_rows(const bf16* table, const int* tokens_dev, bf16* h, int rows, cudaStream_t stream) {
+    if (!table || !tokens_dev || !h || rows < 1 || rows > 8)
+        throw std::invalid_argument("batched device embedding requires 1..8 rows and valid pointers");
+    embed_rows_k<<<dim3(grid(kDim, 256), rows), 256, 0, stream>>>(table, tokens_dev, h);
+    LAUNCH_CHECK("embed_device_rows");
 }
 void window_index_device(const int* pos_dev, int32_t* idx, cudaStream_t stream) {
     window_index_k<<<1, kWindow, 0, stream>>>(0, idx, pos_dev);

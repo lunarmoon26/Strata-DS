@@ -20,6 +20,13 @@ size_t hc_mixes_pre_rows_workspace_bytes(int m);
 /// No allocation, no host synchronization (rule 7).
 void hc_mixes_pre_rows(const __nv_bfloat16* x, int m, const float* fn, const float* scale, const float* base,
                        const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb, void* workspace,
-                       size_t workspace_bytes, cudaStream_t stream);
+                        size_t workspace_bytes, cudaStream_t stream);
+
+/// Opt-in exact-order grid batching: all eight-row tiles in two launches.
+/// Caller-owned, 256-byte-aligned scratch; safe for concurrent disjoint calls.
+size_t hc_mixes_pre_rows_batched_workspace_bytes(int m);
+void hc_mixes_pre_rows_batched(const __nv_bfloat16* x, int m, const float* fn, const float* scale, const float* base,
+                               const float* pre_in, __nv_bfloat16* y, float* pre, float* post, float* comb,
+                               void* workspace, size_t workspace_bytes, cudaStream_t stream);
 
 }  // namespace strata::ds41::kernels

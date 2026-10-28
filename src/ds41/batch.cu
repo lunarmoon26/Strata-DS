@@ -243,8 +243,8 @@ void Engine::Impl::enqueue_slots(int m) {
         ops::rmsnorm(v.xf, y.ffn_norm, v.xf, kDim, kNormEps, m, st);
         // the routed experts of all rows: VRAM hits and a quota of RAM misses per row on the GPU (staged), the CPU
         // the rest, as the decode path does for one row
-        int32_t* ids = v.routes + l * VerifyWorkspace::M * kTopK;
-        float* w = v.weights + l * VerifyWorkspace::M * kTopK;
+        int32_t* ids = v.routes + l * v.M * kTopK;
+        float* w = v.weights + l * v.M * kTopK;
         kernels::router_topk(v.xf, m, y.gate_w, y.gate_bias, ids, w, st);
         ops::to_half_fp8q(v.xf, v.half, m * kDim, st);
         const bool tier = vram && vram->slots() > 0;
@@ -257,7 +257,8 @@ void Engine::Impl::enqueue_slots(int m) {
         ck(cudaMemsetAsync(v.routed, 0, m * kDim * sizeof(float), st), "batch routed");
         if (!staged && (tier || ram))
             kernels::exl3_moe_decode((const __half*) v.half, m, v.selected, w, kTopK, v.db->gpu_experts(), v.routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st,
+                                     rate_hints_[l]);
         linear(v.xf, y.sh_w1, v.g);
         linear(v.xf, y.sh_w3, v.u);
         ops::swiglu(v.g, v.u, kSwigluLimit, v.sh_h, m * kMoeInter, st);
@@ -265,7 +266,8 @@ void Engine::Impl::enqueue_slots(int m) {
         if (staged) {
             batch_stage->join(st);
             kernels::exl3_moe_decode((const __half*) v.half, m, v.selected, w, kTopK, v.db->gpu_experts(), v.routed,
-                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st);
+                                     vram ? vram->workspace() : zc_workspace.get(), VramExperts::kWorkspaceBytes, st,
+                                     rate_hints_[l]);
         }
         v.db->wait_add(v.routed, m, l + 1, st);
         ops::add_f32_bf16(v.routed, v.sh_out, v.ffn_out, m * kDim, st);
@@ -281,7 +283,7 @@ void Engine::Impl::enqueue_slots(int m) {
     ck(cudaMemcpyAsync(v.next_host, v.next, m * sizeof(int), cudaMemcpyDeviceToHost, st), "batch next");
     ck(cudaMemcpyAsync(v.logits_host, v.logits, size_t(m) * kVocab * sizeof(float), cudaMemcpyDeviceToHost, st),
        "batch logits");
-    ck(cudaMemcpyAsync(v.routes_host, v.routes, kLayers * VerifyWorkspace::M * kTopK * sizeof(int32_t),
+    ck(cudaMemcpyAsync(v.routes_host, v.routes, kLayers * v.M * kTopK * sizeof(int32_t),
                        cudaMemcpyDeviceToHost, st), "batch routes");
 }
 
@@ -448,7 +450,7 @@ std::vector<int> Engine::Impl::step_slots(const std::vector<int>& rows, const st
         int32_t row[kLayers * kTopK];
         for (int t = 0; t < m; ++t) {
             for (int l = 0; l < kLayers; ++l)
-                std::copy_n(v.routes_host + (l * VerifyWorkspace::M + t) * kTopK, kTopK, row + l * kTopK);
+                std::copy_n(v.routes_host + (l * v.M + t) * kTopK, kTopK, row + l * kTopK);
             if (vram) vram->count(row, kTopK);
             if (host && host->reserve() > 0) host->end_step(row, kTopK);   // publish the step's reads, record uses
         }

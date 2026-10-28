@@ -80,6 +80,7 @@ public:
     const DenseTensor& dense(const std::string& name) const;
     bool has_dense(const std::string& name) const { return dense_.count(name) != 0; }
     bool has_exl3_dense() const { return has_dense("head.trellis"); }
+    bool experimental_29() const { return experimental_29_; }
     kernels::Exl3Proj exl3_projection(const std::string& name, int k, int n) const;
     const ExpertSlot& expert(int layer, int e) const { return experts_[(size_t) layer * n_experts_ + e]; }
     const uint8_t* expert_base() const { return experts_map_; }
@@ -105,6 +106,7 @@ public:
 private:
     std::string dir_;
     int n_layers_ = 0;
+    bool experimental_29_ = false;
     int n_experts_ = 0;
     std::map<std::string, DenseTensor> dense_;
     std::vector<ExpertSlot> experts_;

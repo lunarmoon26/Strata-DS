@@ -65,18 +65,16 @@ __device__ inline float round_pow2(float a) {
 // K10's arithmetic and cast sequence, with only the row/group indexing changed.
 // blockIdx.y must remain the 128-element chunk: upstream helpers index the
 // FULL suh/svh scale vector using y.
-__global__ void activate_down_had(const float* weights, const Exl3Expert* expert,
-                                  int rows, const float* gu, half* down_input) {
-    const int row = blockIdx.x;
+__device__ inline void activate_down_had_inner(float weight, const Exl3Expert& e,
+                                               const float* gate_input,const float* up_input,half* down_input) {
     const int off = blockIdx.y * 128;
     const int lane = threadIdx.x;
-    const Exl3Expert e = *expert;
     __shared__ __align__(16) float gate[128];
     __shared__ __align__(16) float up[128];
     __shared__ __align__(16) half hidden[128];
-    had_ff_r_128_inner<false, true>(gu + size_t(row) * F + off,
+    had_ff_r_128_inner<false, true>(gate_input + off,
                                    gate, e.w1.svh, HAD_SCALE);
-    had_ff_r_128_inner<false, true>(gu + size_t(rows + row) * F + off,
+    had_ff_r_128_inner<false, true>(up_input + off,
                                    up, e.w3.svh, HAD_SCALE);
     __syncwarp();
     #pragma unroll
@@ -84,7 +82,7 @@ __global__ void activate_down_had(const float* weights, const Exl3Expert* expert
         const float g = fminf(gate[i + lane], 10.0f);
         const float u = fminf(fmaxf(up[i + lane], -10.0f), 10.0f);
         const float silu = g / (1.0f + expf(-g));
-        const float raw = (silu * u) * weights[row];
+        const float raw = (silu * u) * weight;
         if (!e.native_qdq) {
             hidden[i + lane] = __float2half_rn(raw);
             continue;
@@ -100,8 +98,15 @@ __global__ void activate_down_had(const float* weights, const Exl3Expert* expert
             __bfloat162float(__float2bfloat16_rn(float(q) * scale)));
     }
     __syncwarp();
-    had_hf_r_128_inner<true, false>(hidden, down_input + size_t(row) * F + off,
-                                   e.w2.suh, HAD_SCALE);
+    had_hf_r_128_inner<true, false>(hidden, down_input + off,
+                                    e.w2.suh, HAD_SCALE);
+}
+
+__global__ void activate_down_had(const float* weights, const Exl3Expert* expert,
+                                  int rows, const float* gu, half* down_input) {
+    const int row=blockIdx.x;
+    activate_down_had_inner(weights[row],*expert,gu+size_t(row)*F,gu+size_t(rows+row)*F,
+                            down_input+size_t(row)*F);
 }
 
 // Only assigned tokens are touched. Atomics also cover repeated tokens within

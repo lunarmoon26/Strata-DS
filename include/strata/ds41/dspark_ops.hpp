@@ -6,6 +6,7 @@
 #pragma once
 
 #include "strata/ds41/ops.hpp"
+#include <cuda_fp16.h>
 
 #include <cstdint>
 
@@ -30,15 +31,21 @@ void hc_mean_rows(const bf16* h, int m, bf16* out, int64_t out_stride, cudaStrea
 /// picks by s + bias (ties: lower id), weight = s / (sum of the picks' s + 1e-20) * 1.5.
 ///   x [m][kDim], w [n_exp][kDim], bias [n_exp] -> ids [m][topk], weights [m][topk]. n_exp <= 256, topk <= 8.
 void router_small(const bf16* x, int m, const bf16* w, const float* bias, int n_exp, int topk, int32_t* ids,
-                  float* weights, cudaStream_t stream = 0);
+                   float* weights, cudaStream_t stream = 0);
+/// Identical selection from precomputed native FP16-router logits.
+void router_small_scores(const float* scores,int m,const float* bias,int n_exp,int topk,int32_t* ids,
+                         float* weights,cudaStream_t stream=0);
 
 /// DSparkMarkovHead for one draft: e = embed[*token] (kMarkovRank wide, copied to embed_out), then
 /// logits[v] += head[v] . e in FP32 for every v < n_vocab
 void markov_bias(const int* token, const bf16* embed, const bf16* head, int64_t n_vocab, float* logits,
-                 bf16* embed_out, cudaStream_t stream = 0);
+                  bf16* embed_out, cudaStream_t stream = 0);
+void markov_bias(const int* token,const bf16* embed,const __half* head,int64_t n_vocab,float* logits,
+                 bf16* embed_out,cudaStream_t stream=0);
 
 /// DSparkConfidenceHead: out[r] = w . [x[r] (kDim), e[r] (kMarkovRank)] in FP32 (the logit; sigmoid on the host)
 void confidence_rows(const bf16* x, const bf16* e, const bf16* w, int m, float* out, cudaStream_t stream = 0);
+void confidence_rows(const bf16* x,const bf16* e,const __half* w,int m,float* out,cudaStream_t stream=0);
 
 /// get_dspark_topk_idxs as sparse_attn_decode reads it: per row [kWindow + kBlock] ids; j < kWindow is ring slot j when
 /// j <= *start_pos (the slots written so far), else -1; then kWindow + i for the block's rows i < kBlock

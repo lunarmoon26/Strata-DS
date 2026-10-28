@@ -20,6 +20,7 @@ struct Workspace {
     float* gu;         // [slots * 2][F], FP32 gate/up before output Hadamards
     half* down_input;  // [slots][F], quantized activation after input Hadamard
     float* down;       // [slots][H], FP32 down before output Hadamard
+    int* groups;       // [2 * slots][9], optional grouped GEMV plan
 
     static constexpr size_t job_bytes(int slots) {
         return (size_t(2) * slots * sizeof(Job) + 15) & ~size_t(15);
@@ -27,7 +28,7 @@ struct Workspace {
     static constexpr size_t bytes(int slots) {
         return job_bytes(slots) + size_t(slots) *
             (2 * H * sizeof(half) + 2 * F * sizeof(float) +
-             F * sizeof(half) + H * sizeof(float));
+              F * sizeof(half) + H * sizeof(float) + 18 * sizeof(int));
     }
     Workspace(void* p, int slots) {
         jobs = static_cast<Job*>(p);
@@ -35,6 +36,7 @@ struct Workspace {
         gu = reinterpret_cast<float*>(input + size_t(2) * slots * H);
         down_input = reinterpret_cast<half*>(gu + size_t(2) * slots * F);
         down = reinterpret_cast<float*>(down_input + size_t(slots) * F);
+        groups = reinterpret_cast<int*>(down + size_t(slots) * H);
     }
 };
 static_assert(Workspace::bytes(48) <= (64ull << 20), "K10 workspace exceeds contract");

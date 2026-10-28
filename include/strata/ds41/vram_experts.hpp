@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -33,6 +34,17 @@
 namespace strata::ds41 {
 
 class HostExperts;
+class BoundedUpload;
+
+/// Strict opt-in MiB budget, unset/0 disables; rejects signs, suffixes and >8192.
+size_t experimental_decode_cache_bytes(const char* value);
+/// Total pinned RAM budget, even integer MiB in 0..16384; 0/unset disables.
+size_t experimental_ram_cache_bytes(const char* value);
+/// Optional logical stage/rank split A,B in MiB; sum must equal total_bytes.
+size_t experimental_ram_cache_stage_bytes(const char* split, size_t total_bytes, int rank);
+/// Optional exact static counts by logical stage/rank, for matched experiments.
+/// Unset gives -1 (automatic); supplied counts must both be in 1..15360.
+int experimental_resident_slot_limit(const char* value, int rank);
 
 /// Reads a STRP profile: the ranked (layer, expert) pairs. Throws when the file is not a profile of this shape.
 std::vector<std::pair<int, int>> read_expert_profile(const std::string& path, int n_layers, int n_experts);
@@ -65,7 +77,9 @@ public:
     /// first pairs while their bytes fit in the free VRAM after keeping `reserve_bytes` free (and the workspace), as
     /// upstream (it stops at the first that does not fit). 0 slots is valid (no tier).
     VramExperts(const Pack& pack, const std::string& profile_path, int64_t n_slots, size_t reserve_bytes,
-                Adapt adapt, int first_layer = 0, int end_layer = -1, bool require_all = false, int tensor_rank = -1);
+                Adapt adapt, int first_layer = 0, int end_layer = -1, bool require_all = false, int tensor_rank = -1,
+                bool bounded_misses = false, size_t decode_cache_bytes = 0, size_t ram_cache_bytes = 0,
+                bool async_cached_routes = false);
     ~VramExperts();
     VramExperts(const VramExperts&) = delete;
     VramExperts& operator=(const VramExperts&) = delete;
@@ -83,6 +97,38 @@ public:
     /// [slots] expert descriptors on the device (pointers into the slots)
     const kernels::Exl3Expert* experts_dev() const { return experts_dev_; }
     void* workspace() const { return ws_; }
+    /// Experimental eager decode only: stage every missing selected expert, then
+    /// publish a complete GPU descriptor selection. No CPU expert computation.
+    void prepare_decode(int layer, const int32_t* ids, int topk, int32_t* selected, cudaStream_t stream,
+                        bool resident_fastpath = false);
+    /// Hit-only 1..6-row selection. False means no cache/LRU/selection changes;
+    /// caller stages rows normally. One stream fence protects prior consumers;
+    /// the selection is published by-value, never from a borrowed host buffer.
+    bool try_cached_rows(int layer,const int32_t* ids,int rows,int topk,int32_t* selected,cudaStream_t stream);
+    int64_t cached_row_batches() const { return cached_row_batches_; }
+    /// Optional two-phase equivalent. One owned pinned read may be in flight;
+    /// finish preserves try_cached_rows' validation, miss and LRU semantics.
+    void begin_cached_rows(int layer,const int32_t* ids,int rows,int topk,int32_t* selected,cudaStream_t stream);
+    bool finish_cached_rows();
+    void cancel_cached_rows() noexcept;
+    int64_t async_cached_row_reads() const { return async_cached_row_reads_; }
+    struct PrefillPrime { int gpu_fills=0,ram_fills=0;uint64_t bytes=0; };
+    /// Idle-engine operation only. Fills empty slots; retains every valid entry.
+    /// Lookups remain immutable until the caller joins every prefill reader.
+    PrefillPrime prime_prefill_cache();
+    int prefill_gpu_slot(int layer,int expert) const;
+    const uint8_t* prefill_ram_source(int layer,int expert) const;
+    bool fully_resident_layer(int layer) const { return !lent_ && full_layers_.at(layer); }
+    bool streaming() const { return bool(miss_upload_); }
+    int64_t streamed_decode_experts() const { return streamed_decode_; }
+    int decode_cache_slots() const { return int(miss_cache_.size()); }
+    int64_t decode_cache_hits() const { return cache_hits_; }
+    int64_t decode_cache_evictions() const { return cache_evictions_; }
+    int ram_cache_slots() const { return int(ram_cache_.size()); }
+    size_t ram_cache_bytes() const { return ram_cache_.size() * ram_slot_bytes_; }
+    int64_t ram_cache_hits() const { return ram_hits_; }
+    int64_t ram_cache_fills() const { return ram_fills_; }
+    uint64_t ram_cache_read_bytes() const { return ram_read_bytes_; }
 
     /// Count one step's routing: routes [n_layers][topk], host memory.
     void count(const int32_t* routes, int topk);
@@ -114,8 +160,10 @@ public:
 
 private:
     void cleanup() noexcept;
+    bool resolve_cached_rows(int layer,const int32_t* routes,int n,int32_t* selected,cudaStream_t stream);
     kernels::Exl3Expert describe(int layer, int expert, int slot) const;
     void upload_res();
+    const uint8_t* ram_payload(int layer, int expert);
     int commit_pending(bool wait);   ///< commits finished adaptive copies (waits for them when `wait`); returns count
     struct Pending {
         int32_t layer, in, out;
@@ -129,15 +177,45 @@ private:
     const Pack& pack_;
     Adapt adapt_;
     int device_ = 0;
+    int first_layer_ = 0, end_layer_ = 0;
     int slots_ = 0;
     std::vector<size_t> off_{0};       ///< [slots + 1] slot offsets in the arena, 256 B aligned
     size_t max_slot_bytes_ = 0;
     uint8_t* arena_ = nullptr;
     int32_t* res_dev_ = nullptr;
     std::vector<int32_t> res_host_;
+    std::vector<uint8_t> full_layers_;
     kernels::Exl3Expert* experts_dev_ = nullptr;
     std::vector<kernels::Exl3Expert> desc_host_;
     void* ws_ = nullptr;
+    std::unique_ptr<BoundedUpload> miss_upload_;
+    uint8_t* miss_arena_ = nullptr;
+    int tensor_rank_ = -1;
+    int64_t streamed_decode_ = 0;
+    struct CacheEntry { int owner = -1; uint64_t age = 0; };
+    std::vector<CacheEntry> miss_cache_;
+    std::vector<int32_t> miss_cache_lookup_;
+    uint8_t* miss_cache_arena_ = nullptr;
+    uint64_t cache_clock_ = 0;
+    bool frequency_cache_ = false;
+    std::vector<uint64_t> route_frequency_;
+    int64_t cache_hits_ = 0, cache_evictions_ = 0;
+    int64_t cached_row_batches_ = 0;
+    int32_t* async_routes_ = nullptr;  ///< owned pinned read target; never stack memory
+    bool async_routes_failed_ = false; ///< failed drain poisons this tier, never reuses the host buffer
+    struct PendingRows {
+        int layer = 0, count = 0;
+        int32_t* selected = nullptr;
+        cudaStream_t stream = nullptr;
+        bool active = false;
+    } pending_rows_;
+    int64_t async_cached_row_reads_ = 0;
+    uint8_t* ram_arena_ = nullptr;
+    size_t ram_slot_bytes_ = 0;
+    std::vector<CacheEntry> ram_cache_;
+    std::vector<int32_t> ram_lookup_;
+    uint64_t ram_clock_ = 0, ram_read_bytes_ = 0;
+    int64_t ram_hits_ = 0, ram_fills_ = 0;
     // adaptive tier
     std::vector<float> usage_;
     int64_t calls_ = 0, swaps_total_ = 0;
